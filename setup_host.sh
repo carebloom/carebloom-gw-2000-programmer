@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# setup_host.sh — One-time setup for a Raspberry Pi (Trixie, Desktop) acting
+# setup_host.sh - One-time setup for a Raspberry Pi (Trixie, Desktop) acting
 # as the production host for CM4 flashing on the Waveshare CM4-IO-Base-C.
 #
 # Run once as the desktop user (NOT as root). It will prompt for sudo when needed.
@@ -44,10 +44,10 @@ SRC_CANDIDATES=(
 
 # ---------- Helpers -----------------------------------------------------------
 
-say()   { printf "\n\033[1;36m▶ %s\033[0m\n" "$*"; }
-ok()    { printf "  \033[1;32m✓ %s\033[0m\n" "$*"; }
-warn()  { printf "  \033[1;33m⚠ %s\033[0m\n" "$*"; }
-die()   { printf "\n\033[1;31m✗ %s\033[0m\n" "$*" >&2; exit 1; }
+say()   { printf "\n[ %s ]\n" "$*"; }
+ok()    { printf "  OK: %s\n" "$*"; }
+warn()  { printf "  WARN: %s\n" "$*"; }
+die()   { printf "\nFAIL: %s\n" "$*" >&2; exit 1; }
 
 require_not_root() {
     if [ "$(id -u)" -eq 0 ]; then
@@ -79,7 +79,7 @@ ok "Found flasher script: $FLASHER_SRC"
 
 # ---------- 1. APT packages ---------------------------------------------------
 
-say "Installing system packages (apt)…"
+say "Installing system packages (apt)..."
 sudo apt-get update -y
 sudo apt-get install -y \
     git build-essential pkg-config \
@@ -87,13 +87,13 @@ sudo apt-get install -y \
     xz-utils unzip gzip \
     python3 python3-tk python3-pip python3-paramiko python3-zeroconf \
     openssl avahi-utils iputils-ping iputils-arping \
-    udisks2 policykit-1 \
+    udisks2 polkitd \
     yad zenity
 ok "apt packages installed"
 
 # ---------- 2. Build rpiboot --------------------------------------------------
 
-say "Building rpiboot from source…"
+say "Building rpiboot from source..."
 sudo mkdir -p "$INSTALL_DIR"
 sudo chown "$USER":"$USER" "$INSTALL_DIR"
 if [ -d "$INSTALL_DIR/.git" ]; then
@@ -106,7 +106,7 @@ ok "rpiboot built at $INSTALL_DIR/rpiboot"
 
 # ---------- 3. udev rule so non-root users can run rpiboot --------------------
 
-say "Installing udev rule for Broadcom BCM2711/2712 (no sudo needed for rpiboot)…"
+say "Installing udev rule for Broadcom BCM2711/2712 (no sudo needed for rpiboot)..."
 sudo tee /etc/udev/rules.d/99-rpiboot.rules > /dev/null <<'EOF'
 # Raspberry Pi CM4 / CM5 in mass-storage / rpiboot mode
 SUBSYSTEM=="usb", ATTRS{idVendor}=="0a5c", ATTRS{idProduct}=="2711", MODE="0660", GROUP="plugdev", TAG+="uaccess"
@@ -119,7 +119,7 @@ ok "udev rule installed"
 
 # ---------- 4. Polkit rule so the user can write to /dev/sdX without sudo -----
 
-say "Installing polkit rule for udisks2…"
+say "Installing polkit rule for udisks2..."
 sudo tee /etc/polkit-1/rules.d/50-cm4-flasher.rules > /dev/null <<EOF
 // Let plugdev members operate on removable USB block devices without auth.
 polkit.addRule(function(action, subject) {
@@ -134,14 +134,14 @@ ok "polkit rule installed"
 
 # ---------- 5. Add operator user to plugdev -----------------------------------
 
-say "Adding $USER to plugdev group…"
+say "Adding $USER to plugdev group..."
 sudo usermod -aG plugdev "$USER"
 ok "User added to plugdev (takes effect on next login)"
 
 # ---------- 6. Allow flashing without a sudo password ------------------------
 # We narrow this to ONLY the binaries we need, not blanket NOPASSWD.
 
-say "Configuring sudoers for the specific commands the flasher uses…"
+say "Configuring sudoers for the specific commands the flasher uses..."
 SUDOERS_FILE="/etc/sudoers.d/010-cm4-flasher"
 sudo tee "$SUDOERS_FILE" > /dev/null <<EOF
 # Allow flashing CM4 boards without password prompts. Narrow to specific commands.
@@ -155,7 +155,7 @@ ok "sudoers rule installed"
 
 mkdir -p "$IMAGES_DIR"
 if [ ! -f "$IMAGES_DIR/$IMAGE_BASENAME" ]; then
-    say "Downloading OS image to $IMAGES_DIR/$IMAGE_BASENAME…"
+    say "Downloading OS image to $IMAGES_DIR/$IMAGE_BASENAME..."
     if command -v curl >/dev/null; then
         curl -L --progress-bar -o "$IMAGES_DIR/$IMAGE_BASENAME" "$IMAGE_URL"
     else
@@ -168,7 +168,7 @@ fi
 
 # ---------- 8. Install the flasher script ------------------------------------
 
-say "Installing cm4_flasher.py…"
+say "Installing cm4_flasher.py..."
 mkdir -p "$APP_DIR"
 cp "$FLASHER_SRC" "$FLASHER_PATH"
 chmod +x "$FLASHER_PATH"
@@ -176,7 +176,7 @@ ok "Installed to $FLASHER_PATH"
 
 # ---------- 9. Create a launcher icon -----------------------------------------
 
-say "Creating desktop launcher…"
+say "Creating desktop launcher..."
 # Simple bundled icon. If you have a branded one, drop it at $ICON_PATH and
 # this overwrite step won't run.
 if [ ! -f "$ICON_PATH" ]; then
