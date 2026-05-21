@@ -62,6 +62,13 @@ PI_MAC_PREFIXES = ("b8:27:eb", "dc:a6:32", "e4:5f:01",
 LOG_FILE = str(Path.home() / "cm4_flash_log.csv")
 CONFIG_FILE = str(Path.home() / ".cm4_flasher.json")
 
+# Full transcripts of each operation, for sharing when something goes wrong.
+# Each run overwrites the file so it always reflects the most recent attempt.
+TRANSCRIPT_DIR = str(Path.home() / "cm4-flasher-logs")
+FLASH_LOG = os.path.join(TRANSCRIPT_DIR, "flash_transcript.log")
+VERIFY_LOG = os.path.join(TRANSCRIPT_DIR, "verify_transcript.log")
+INSTALL_LOG = os.path.join(TRANSCRIPT_DIR, "install_transcript.log")
+
 
 # =============================================================================
 # Helpers
@@ -286,7 +293,7 @@ class App(tk.Tk):
             self.tk.call("tk", "scaling", 1.3)
         except Exception:
             pass
-        self.geometry("1100x820")
+        self.geometry("1100x900")
         self.minsize(960, 700)
 
         self._log_q = queue.Queue()
@@ -338,14 +345,19 @@ class App(tk.Tk):
     # ---- UI ----------------------------------------------------------------
     def _build_ui(self):
         top = ttk.Frame(self, padding=8)
-        top.pack(fill="x")
+        top.pack(side="top", fill="x")
         ttk.Label(top, text="CM4 Production Flasher",
                   font=("DejaVu Sans", 18, "bold")).pack(side="left")
         ttk.Label(top, text="  Waveshare CM4-IO-Base-C",
                   foreground="#666").pack(side="left", padx=10, pady=8)
 
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=8, pady=4)
+        # A vertical PanedWindow holds the notebook (top) and the Log panel
+        # (bottom). The sash between them can be dragged to resize the log.
+        paned = ttk.PanedWindow(self, orient="vertical")
+        paned.pack(side="top", fill="both", expand=True, padx=8, pady=4)
+        self._paned = paned
+
+        nb = ttk.Notebook(paned)
         self.cfg_tab = ttk.Frame(nb)
         self.flash_tab = ttk.Frame(nb)
         self.verify_tab = ttk.Frame(nb)
@@ -356,17 +368,34 @@ class App(tk.Tk):
         nb.add(self.install_tab, text="4. App Installation")
         self.notebook = nb
 
+        logf = ttk.LabelFrame(paned, text="Log  (drag the divider above to resize)")
+        self.log_widget = scrolledtext.ScrolledText(
+            logf, wrap="word", font=("DejaVu Sans Mono", 10))
+        self.log_widget.pack(fill="both", expand=True)
+        self.log_widget.configure(state="disabled")
+
+        # weight controls how extra space is shared when the window resizes:
+        # the notebook gets the lion's share, the log a steady slice.
+        paned.add(nb, weight=3)
+        paned.add(logf, weight=2)
+
+        # Set the initial sash position so the Log starts ~320 px tall.
+        # Must run after the window has a real size, hence 'after'.
+        def _place_sash():
+            try:
+                h = paned.winfo_height()
+                if h > 400:
+                    paned.sashpos(0, h - 320)
+                else:
+                    self.after(120, _place_sash)
+            except Exception:
+                pass
+        self.after(150, _place_sash)
+
         self._build_cfg_tab(self.cfg_tab)
         self._build_flash_tab(self.flash_tab)
         self._build_verify_tab(self.verify_tab)
         self._build_install_tab(self.install_tab)
-
-        logf = ttk.LabelFrame(self, text="Log")
-        logf.pack(fill="both", expand=False, padx=8, pady=(0, 8))
-        self.log_widget = scrolledtext.ScrolledText(
-            logf, height=10, wrap="word", font=("DejaVu Sans Mono", 10))
-        self.log_widget.pack(fill="both", expand=True)
-        self.log_widget.configure(state="disabled")
 
     def _row(self, parent, r, label, var, browse=None, show=None, hint=""):
         ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", padx=6, pady=4)
@@ -476,9 +505,15 @@ class App(tk.Tk):
         self.start_btn.pack(side="left", padx=4, ipadx=20, ipady=6)
         ttk.Button(ctrl, text="Reset", command=self._reset_steps).pack(side="left", padx=4)
 
-        self.flash_status = ttk.Label(wrap, text="Ready.",
+        statusf = ttk.LabelFrame(wrap, text="Status")
+        statusf.pack(fill="x", pady=(8, 0))
+        self.flash_status = ttk.Label(statusf, text="Ready.",
                                        font=("DejaVu Sans", 13))
-        self.flash_status.pack(anchor="w", pady=8)
+        self.flash_status.pack(anchor="w", padx=6, pady=8)
+        ttk.Label(statusf,
+                  text=f"Detailed step output appears in the Log panel "
+                       f"below. Full transcript saved to: {FLASH_LOG}",
+                  foreground="#888").pack(anchor="w", padx=6, pady=(0, 6))
 
     def _build_verify_tab(self, parent):
         wrap = ttk.Frame(parent, padding=12)
@@ -505,13 +540,20 @@ class App(tk.Tk):
         ttk.Label(ctrl, textvariable=self.found_host,
                   foreground="#666").pack(side="left", padx=8)
 
-        self.verify_status = ttk.Label(wrap, text="",
+        statusf = ttk.LabelFrame(wrap, text="Status")
+        statusf.pack(fill="both", expand=True, pady=(6, 0))
+
+        self.verify_status = ttk.Label(statusf, text="",
                                         font=("DejaVu Sans", 14, "bold"))
-        self.verify_status.pack(anchor="w", pady=6)
+        self.verify_status.pack(anchor="w", padx=6, pady=6)
 
         self.verify_results = scrolledtext.ScrolledText(
-            wrap, height=18, wrap="word", font=("DejaVu Sans Mono", 10))
-        self.verify_results.pack(fill="both", expand=True, pady=6)
+            statusf, height=18, wrap="word", font=("DejaVu Sans Mono", 10))
+        self.verify_results.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        ttk.Label(statusf,
+                  text=f"Full transcript saved to: {VERIFY_LOG}",
+                  foreground="#888").pack(anchor="w", padx=6, pady=(0, 6))
 
     def _build_install_tab(self, parent):
         wrap = ttk.Frame(parent, padding=12)
@@ -570,13 +612,21 @@ class App(tk.Tk):
         ttk.Button(ctrl, text="Reset",
                    command=self._reset_install_steps).pack(side="left", padx=4)
 
-        self.install_status = ttk.Label(wrap, text="Ready.",
+        statusf = ttk.LabelFrame(wrap, text="Status")
+        statusf.pack(fill="both", expand=True, pady=(8, 0))
+
+        self.install_status = ttk.Label(statusf, text="Ready.",
                                          font=("DejaVu Sans", 13))
-        self.install_status.pack(anchor="w", pady=6)
+        self.install_status.pack(anchor="w", padx=6, pady=6)
 
         self.install_results = scrolledtext.ScrolledText(
-            wrap, height=14, wrap="word", font=("DejaVu Sans Mono", 10))
-        self.install_results.pack(fill="both", expand=True, pady=6)
+            statusf, height=14, wrap="word", font=("DejaVu Sans Mono", 10))
+        self.install_results.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # Where the full install transcript is written, so it can be shared.
+        ttk.Label(statusf,
+                  text=f"Full transcript saved to: {INSTALL_LOG}",
+                  foreground="#888").pack(anchor="w", padx=6, pady=(0, 6))
 
     def _install_use_verified(self):
         """Populate the target host from the most recent verified board."""
@@ -605,7 +655,28 @@ class App(tk.Tk):
             self._set_install_step(i, "pending")
         self.install_status.configure(text="Ready.", foreground="#000")
 
+    def _write_transcript(self, path, s):
+        """Append one line to a transcript file. Failures here are silent -
+        transcript logging must never break the actual operation."""
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(s + "\n")
+        except Exception:
+            pass
+
+    def _start_transcript(self, path, title):
+        """Truncate a transcript file and write a header. Called at the start
+        of each flash / verify / install run."""
+        try:
+            os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"=== {title} ===\n")
+                f.write(f"Started: {datetime.now().isoformat(timespec='seconds')}\n\n")
+        except Exception:
+            pass
+
     def _iresult(self, s):
+        self._write_transcript(INSTALL_LOG, s)
         def upd():
             self.install_results.insert("end", s + "\n")
             self.install_results.see("end")
@@ -613,6 +684,7 @@ class App(tk.Tk):
 
 
     def log(self, s):
+        self._write_transcript(FLASH_LOG, s)
         self._log_q.put(s)
 
     def _drain_log(self):
@@ -698,6 +770,7 @@ class App(tk.Tk):
             return
 
         self._reset_steps()
+        self._start_transcript(FLASH_LOG, "CM4 Flash")
         self.start_btn.configure(state="disabled")
         self.flash_status.configure(text="Running…", foreground="#0a7")
         threading.Thread(target=self._flash_workflow, daemon=True).start()
@@ -1055,6 +1128,7 @@ class App(tk.Tk):
 
     # ---- Verify workflow --------------------------------------------------
     def _start_verify_thread(self):
+        self._start_transcript(VERIFY_LOG, "CM4 Verify")
         self.verify_btn.configure(state="disabled")
         self.verify_results.configure(state="normal")
         self.verify_results.delete("1.0", "end")
@@ -1063,6 +1137,7 @@ class App(tk.Tk):
         threading.Thread(target=self._verify_workflow, daemon=True).start()
 
     def _result(self, s):
+        self._write_transcript(VERIFY_LOG, s)
         def upd():
             self.verify_results.insert("end", s + "\n")
             self.verify_results.see("end")
@@ -1344,6 +1419,7 @@ class App(tk.Tk):
             return
 
         self._reset_install_steps()
+        self._start_transcript(INSTALL_LOG, "Carebloom App Installation")
         self.install_results.delete("1.0", "end")
         self.install_btn.configure(state="disabled")
         self.install_status.configure(text="Installing...", foreground="#0a7")
