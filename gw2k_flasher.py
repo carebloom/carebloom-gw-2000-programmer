@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CM4 Flasher — Production flashing & verification tool for the Raspberry Pi CM4
+Care Bloom GW2000 Flasher — production flashing & verification tool for the
 on the Waveshare CM4-IO-Base-C. Runs on a Raspberry Pi host (Trixie/Bookworm
 with Desktop), launched by operators via a desktop icon.
 
@@ -9,7 +9,7 @@ Three tabs:
   2. Flash     — single button, runs the full flash workflow with green ticks
   3. Verify    — finds the freshly-flashed board on the LAN and SSHes in
 
-All sudo calls are pre-authorized via /etc/sudoers.d/010-cm4-flasher so
+All sudo calls are pre-authorized via /etc/sudoers.d/010-gw2k-flasher so
 operators never see a password prompt during normal use.
 """
 
@@ -47,24 +47,24 @@ DEFAULT_RPIBOOT_CANDIDATES = [
     "/usr/local/bin/rpiboot",
 ]
 DEFAULT_BOOTFILES_SUBDIR = "mass-storage-gadget64"
-DEFAULT_IMAGES_DIR = str(Path.home() / "cm4-images")
+DEFAULT_IMAGES_DIR = str(Path.home() / "gw2k-images")
 DEFAULT_USERNAME = "pi"
 DEFAULT_PASSWORD = "raspberry"
 DEFAULT_HOSTNAME = "Carebloom{MAC}"   # {MAC} replaced with eth0 MAC at first boot
 
 # Carebloom application installation
 DEFAULT_APP_NAME = "CARE001"          # top-level folder name inside the app zip
-DEFAULT_APPS_DIR = str(Path.home() / "cm4-apps")  # where app zips live on host
+DEFAULT_APPS_DIR = str(Path.home() / "gw2k-apps")  # where app zips live on host
 
 PI_MAC_PREFIXES = ("b8:27:eb", "dc:a6:32", "e4:5f:01",
                    "2c:cf:67", "d8:3a:dd", "28:cd:c1")
 
-LOG_FILE = str(Path.home() / "cm4_flash_log.csv")
-CONFIG_FILE = str(Path.home() / ".cm4_flasher.json")
+LOG_FILE = str(Path.home() / "gw2k_flash_log.csv")
+CONFIG_FILE = str(Path.home() / ".gw2k_flasher.json")
 
 # Full transcripts of each operation, for sharing when something goes wrong.
 # Each run overwrites the file so it always reflects the most recent attempt.
-TRANSCRIPT_DIR = str(Path.home() / "cm4-flasher-logs")
+TRANSCRIPT_DIR = str(Path.home() / "gw2k-flasher-logs")
 FLASH_LOG = os.path.join(TRANSCRIPT_DIR, "flash_transcript.log")
 VERIFY_LOG = os.path.join(TRANSCRIPT_DIR, "verify_transcript.log")
 INSTALL_LOG = os.path.join(TRANSCRIPT_DIR, "install_transcript.log")
@@ -302,7 +302,7 @@ def find_bootfs_mount(disk_path, deadline):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("CM4 Flasher — Production")
+        self.title("Care Bloom Gateway Flasher")
         try:
             self.tk.call("tk", "scaling", 1.3)
         except Exception:
@@ -360,9 +360,9 @@ class App(tk.Tk):
     def _build_ui(self):
         top = ttk.Frame(self, padding=8)
         top.pack(side="top", fill="x")
-        ttk.Label(top, text="CM4 Production Flasher",
+        ttk.Label(top, text="Care Bloom GW2000 Flasher",
                   font=("DejaVu Sans", 18, "bold")).pack(side="left")
-        ttk.Label(top, text="  Waveshare CM4-IO-Base-C",
+        ttk.Label(top, text="  WAVESHARE CM4-IO-BASE-C",
                   foreground="#666").pack(side="left", padx=10, pady=8)
 
         nb = ttk.Notebook(self)
@@ -760,7 +760,7 @@ class App(tk.Tk):
             return
 
         self._reset_steps()
-        self._start_transcript(FLASH_LOG, "CM4 Flash")
+        self._start_transcript(FLASH_LOG, "GW2000 Flash")
         self.flash_results.configure(state="normal")
         self.flash_results.delete("1.0", "end")
         self.flash_results.configure(state="disabled")
@@ -1121,7 +1121,7 @@ class App(tk.Tk):
 
     # ---- Verify workflow --------------------------------------------------
     def _start_verify_thread(self):
-        self._start_transcript(VERIFY_LOG, "CM4 Verify")
+        self._start_transcript(VERIFY_LOG, "GW2000 Verify")
         self.verify_btn.configure(state="disabled")
         self.verify_results.configure(state="normal")
         self.verify_results.delete("1.0", "end")
@@ -1764,4 +1764,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
