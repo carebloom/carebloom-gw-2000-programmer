@@ -74,6 +74,20 @@ INSTALL_LOG = os.path.join(TRANSCRIPT_DIR, "install_transcript.log")
 # Helpers
 # =============================================================================
 
+# Matches ANSI escape sequences (colors, cursor moves) and terminal control
+# bytes that apt/dpkg emit when they think they're on a real terminal.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b[()][AB0]|\x1b[78]")
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def strip_ansi(s):
+    """Remove ANSI escape sequences and stray control characters so the
+    text renders cleanly in a plain Tk text widget."""
+    s = _ANSI_RE.sub("", s)
+    s = _CTRL_RE.sub("", s)
+    return s
+
+
 def which(cmd):
     return shutil.which(cmd)
 
@@ -351,13 +365,8 @@ class App(tk.Tk):
         ttk.Label(top, text="  Waveshare CM4-IO-Base-C",
                   foreground="#666").pack(side="left", padx=10, pady=8)
 
-        # A vertical PanedWindow holds the notebook (top) and the Log panel
-        # (bottom). The sash between them can be dragged to resize the log.
-        paned = ttk.PanedWindow(self, orient="vertical")
-        paned.pack(side="top", fill="both", expand=True, padx=8, pady=4)
-        self._paned = paned
-
-        nb = ttk.Notebook(paned)
+        nb = ttk.Notebook(self)
+        nb.pack(side="top", fill="both", expand=True, padx=8, pady=8)
         self.cfg_tab = ttk.Frame(nb)
         self.flash_tab = ttk.Frame(nb)
         self.verify_tab = ttk.Frame(nb)
@@ -367,30 +376,6 @@ class App(tk.Tk):
         nb.add(self.verify_tab, text="3. Verify")
         nb.add(self.install_tab, text="4. App Installation")
         self.notebook = nb
-
-        logf = ttk.LabelFrame(paned, text="Log  (drag the divider above to resize)")
-        self.log_widget = scrolledtext.ScrolledText(
-            logf, wrap="word", font=("DejaVu Sans Mono", 10))
-        self.log_widget.pack(fill="both", expand=True)
-        self.log_widget.configure(state="disabled")
-
-        # weight controls how extra space is shared when the window resizes:
-        # the notebook gets the lion's share, the log a steady slice.
-        paned.add(nb, weight=3)
-        paned.add(logf, weight=2)
-
-        # Set the initial sash position so the Log starts ~320 px tall.
-        # Must run after the window has a real size, hence 'after'.
-        def _place_sash():
-            try:
-                h = paned.winfo_height()
-                if h > 400:
-                    paned.sashpos(0, h - 320)
-                else:
-                    self.after(120, _place_sash)
-            except Exception:
-                pass
-        self.after(150, _place_sash)
 
         self._build_cfg_tab(self.cfg_tab)
         self._build_flash_tab(self.flash_tab)
@@ -506,13 +491,18 @@ class App(tk.Tk):
         ttk.Button(ctrl, text="Reset", command=self._reset_steps).pack(side="left", padx=4)
 
         statusf = ttk.LabelFrame(wrap, text="Status")
-        statusf.pack(fill="x", pady=(8, 0))
+        statusf.pack(fill="both", expand=True, pady=(8, 0))
         self.flash_status = ttk.Label(statusf, text="Ready.",
                                        font=("DejaVu Sans", 13))
-        self.flash_status.pack(anchor="w", padx=6, pady=8)
+        self.flash_status.pack(anchor="w", padx=6, pady=6)
+
+        self.flash_results = scrolledtext.ScrolledText(
+            statusf, height=14, wrap="word", font=("DejaVu Sans Mono", 10))
+        self.flash_results.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.flash_results.configure(state="disabled")
+
         ttk.Label(statusf,
-                  text=f"Detailed step output appears in the Log panel "
-                       f"below. Full transcript saved to: {FLASH_LOG}",
+                  text=f"Full transcript saved to: {FLASH_LOG}",
                   foreground="#888").pack(anchor="w", padx=6, pady=(0, 6))
 
     def _build_verify_tab(self, parent):
@@ -691,10 +681,10 @@ class App(tk.Tk):
         try:
             while True:
                 s = self._log_q.get_nowait()
-                self.log_widget.configure(state="normal")
-                self.log_widget.insert("end", s + "\n")
-                self.log_widget.see("end")
-                self.log_widget.configure(state="disabled")
+                self.flash_results.configure(state="normal")
+                self.flash_results.insert("end", s + "\n")
+                self.flash_results.see("end")
+                self.flash_results.configure(state="disabled")
         except queue.Empty:
             pass
         self.after(80, self._drain_log)
@@ -771,6 +761,9 @@ class App(tk.Tk):
 
         self._reset_steps()
         self._start_transcript(FLASH_LOG, "CM4 Flash")
+        self.flash_results.configure(state="normal")
+        self.flash_results.delete("1.0", "end")
+        self.flash_results.configure(state="disabled")
         self.start_btn.configure(state="disabled")
         self.flash_status.configure(text="Running…", foreground="#0a7")
         threading.Thread(target=self._flash_workflow, daemon=True).start()
@@ -1511,7 +1504,7 @@ class App(tk.Tk):
                     break
 
         def emit(line):
-            line = line.rstrip()
+            line = strip_ansi(line).rstrip()
             if not line:
                 return
             # With a PTY, the password we send on stdin is echoed back by
