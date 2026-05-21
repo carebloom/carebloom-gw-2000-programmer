@@ -416,10 +416,10 @@ class App(tk.Tk):
 
         f4 = ttk.LabelFrame(wrap, text="Carebloom application")
         f4.pack(fill="x", pady=(0, 8))
-        self._row(f4, 0, "App zip:", self.app_zip_path,
-                  browse=("file", "Select Carebloom app zip"))
+        self._row(f4, 0, "App archive:", self.app_zip_path,
+                  browse=("file", "Select Carebloom app archive (.tar.gz / .zip)"))
         self._row(f4, 1, "App folder name:", self.app_name,
-                  hint="  (top-level folder inside the zip, e.g. CARE001)")
+                  hint="  (top-level folder inside the archive, e.g. CARE001)")
 
         f3 = ttk.Frame(wrap)
         f3.pack(fill="x", pady=(8, 0))
@@ -520,8 +520,8 @@ class App(tk.Tk):
         ttk.Label(wrap, justify="left", text=(
             "Installs the Carebloom application onto a CM4 that has already\n"
             "been flashed and verified. This automates:\n"
-            "  - SCP the app zip to /tmp on the CM4\n"
-            "  - Unzip it\n"
+            "  - SCP the app archive to /tmp on the CM4\n"
+            "  - Extract it (.tar.gz or .zip)\n"
             "  - apt install dos2unix\n"
             "  - dos2unix + chmod +x on bin/ and etc/\n"
             "  - Run <app>/bin/setupSystemLocal.sh"
@@ -544,8 +544,8 @@ class App(tk.Tk):
         steps_frame.pack(fill="x", pady=8)
         step_defs = [
             ("Connect to CM4 over SSH",   "Uses the configured user / password."),
-            ("Transfer app zip",          "SCP the zip to /tmp on the CM4."),
-            ("Unzip the app",             "Extract into the home directory."),
+            ("Transfer app archive",      "SCP the archive to /tmp on the CM4."),
+            ("Extract the app",           "Unpack into the home directory."),
             ("Install dos2unix",          "apt install dos2unix."),
             ("Fix line endings + perms",  "dos2unix + chmod +x on bin/ and etc/."),
             ("Run setupSystemLocal.sh",   "The Carebloom system setup script."),
@@ -1325,9 +1325,10 @@ class App(tk.Tk):
         problems = []
         zip_path = self.app_zip_path.get().strip()
         if not zip_path or not os.path.isfile(zip_path):
-            problems.append("App zip not found (set it on the Configure tab)")
-        if not zip_path.lower().endswith(".zip"):
-            problems.append("App file must be a .zip")
+            problems.append("App archive not found (set it on the Configure tab)")
+        low = zip_path.lower()
+        if not low.endswith((".zip", ".tar.gz", ".tgz", ".tar")):
+            problems.append("App file must be a .tar.gz, .tgz, .tar or .zip")
         if not self.app_name.get().strip():
             problems.append("App folder name is empty (e.g. CARE001)")
         if not self.install_host.get().strip():
@@ -1464,25 +1465,39 @@ class App(tk.Tk):
                 return False
             self._set_install_step(1, "ok")
 
-            # STEP 3: unzip into the home directory
+            # STEP 3: extract into the home directory
             self._set_install_step(2, "running")
-            # -o overwrite without prompting; -d extract dir
-            rc = self._ssh_exec(
-                client,
-                f"cd {shlex.quote(remote_home)} && "
-                f"unzip -o {shlex.quote(remote_zip)}",
-                label=f"Unzipping into {remote_home}")
-            if rc != 0:
-                # unzip may be missing on a Lite image
-                self._iresult("unzip failed - attempting to install it...")
-                self._ssh_exec(client,
-                               "DEBIAN_FRONTEND=noninteractive apt-get install -y unzip",
-                               label="Install unzip", sudo=True)
+            low = zip_path.lower()
+            is_tar = low.endswith((".tar.gz", ".tgz", ".tar"))
+            if is_tar:
+                # tar handles .gz automatically with -z; works for plain .tar too.
+                # tar is always present on Pi OS, so no fallback install needed.
+                extract_cmd = (
+                    f"cd {shlex.quote(remote_home)} && "
+                    f"tar -xzf {shlex.quote(remote_zip)} 2>/dev/null || "
+                    f"tar -xf {shlex.quote(remote_zip)}"
+                )
+                rc = self._ssh_exec(client, extract_cmd,
+                                    label=f"Extracting tarball into {remote_home}")
+            else:
+                # .zip path
                 rc = self._ssh_exec(
                     client,
                     f"cd {shlex.quote(remote_home)} && "
                     f"unzip -o {shlex.quote(remote_zip)}",
-                    label="Unzipping (retry)")
+                    label=f"Unzipping into {remote_home}")
+                if rc != 0:
+                    # unzip may be missing on a Lite image
+                    self._iresult("unzip failed - attempting to install it...")
+                    self._ssh_exec(
+                        client,
+                        "DEBIAN_FRONTEND=noninteractive apt-get install -y unzip",
+                        label="Install unzip", sudo=True)
+                    rc = self._ssh_exec(
+                        client,
+                        f"cd {shlex.quote(remote_home)} && "
+                        f"unzip -o {shlex.quote(remote_zip)}",
+                        label="Unzipping (retry)")
             if rc != 0:
                 self._set_install_step(2, "fail")
                 return False
@@ -1492,8 +1507,10 @@ class App(tk.Tk):
                 label=f"Checking {app_dir} exists")
             if rc != 0:
                 self._iresult(
-                    f"ERROR: expected folder {app_dir} not found after unzip. "
-                    f"Check the 'App folder name' on the Configure tab.")
+                    f"ERROR: expected folder {app_dir} not found after "
+                    f"extraction. Check the 'App folder name' on the "
+                    f"Configure tab - it must match the top-level folder "
+                    f"inside the archive.")
                 self._set_install_step(2, "fail")
                 return False
             self._set_install_step(2, "ok")
