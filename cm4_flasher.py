@@ -52,6 +52,10 @@ DEFAULT_USERNAME = "pi"
 DEFAULT_PASSWORD = "raspberry"
 DEFAULT_HOSTNAME = "Carebloom{MAC}"   # {MAC} replaced with eth0 MAC at first boot
 
+# Carebloom application installation
+DEFAULT_APP_NAME = "CARE001"          # top-level folder name inside the app zip
+DEFAULT_APPS_DIR = str(Path.home() / "cm4-apps")  # where app zips live on host
+
 PI_MAC_PREFIXES = ("b8:27:eb", "dc:a6:32", "e4:5f:01",
                    "2c:cf:67", "d8:3a:dd", "28:cd:c1")
 
@@ -301,6 +305,11 @@ class App(tk.Tk):
         self.found_ip = tk.StringVar(value="")
         self.found_host = tk.StringVar(value="")
 
+        # App installation
+        self.app_zip_path = tk.StringVar(value="")
+        self.app_name = tk.StringVar(value=DEFAULT_APP_NAME)
+        self.install_host = tk.StringVar(value="")
+
         self.steps = []
         self.expected_hostname = None
         self.expected_user = None
@@ -340,14 +349,17 @@ class App(tk.Tk):
         self.cfg_tab = ttk.Frame(nb)
         self.flash_tab = ttk.Frame(nb)
         self.verify_tab = ttk.Frame(nb)
+        self.install_tab = ttk.Frame(nb)
         nb.add(self.cfg_tab, text="1. Configure")
         nb.add(self.flash_tab, text="2. Flash")
         nb.add(self.verify_tab, text="3. Verify")
+        nb.add(self.install_tab, text="4. App Installation")
         self.notebook = nb
 
         self._build_cfg_tab(self.cfg_tab)
         self._build_flash_tab(self.flash_tab)
         self._build_verify_tab(self.verify_tab)
+        self._build_install_tab(self.install_tab)
 
         logf = ttk.LabelFrame(self, text="Log")
         logf.pack(fill="both", expand=False, padx=8, pady=(0, 8))
@@ -401,6 +413,13 @@ class App(tk.Tk):
                   hint="  (blank = Ethernet only)")
         self._row(f2, 4, "Wi-Fi password:", self.wifi_psk, show="•")
         self._row(f2, 5, "Wi-Fi country:", self.wifi_country)
+
+        f4 = ttk.LabelFrame(wrap, text="Carebloom application")
+        f4.pack(fill="x", pady=(0, 8))
+        self._row(f4, 0, "App zip:", self.app_zip_path,
+                  browse=("file", "Select Carebloom app zip"))
+        self._row(f4, 1, "App folder name:", self.app_name,
+                  hint="  (top-level folder inside the zip, e.g. CARE001)")
 
         f3 = ttk.Frame(wrap)
         f3.pack(fill="x", pady=(8, 0))
@@ -494,7 +513,105 @@ class App(tk.Tk):
             wrap, height=18, wrap="word", font=("DejaVu Sans Mono", 10))
         self.verify_results.pack(fill="both", expand=True, pady=6)
 
-    # ---- Logging -----------------------------------------------------------
+    def _build_install_tab(self, parent):
+        wrap = ttk.Frame(parent, padding=12)
+        wrap.pack(fill="both", expand=True)
+
+        ttk.Label(wrap, justify="left", text=(
+            "Installs the Carebloom application onto a CM4 that has already\n"
+            "been flashed and verified. This automates:\n"
+            "  - SCP the app zip to /tmp on the CM4\n"
+            "  - Unzip it\n"
+            "  - apt install dos2unix\n"
+            "  - dos2unix + chmod +x on bin/ and etc/\n"
+            "  - Run <app>/bin/setupSystemLocal.sh"
+        )).pack(anchor="w", pady=(0, 8))
+
+        # Target host row
+        hostf = ttk.Frame(wrap)
+        hostf.pack(fill="x", pady=4)
+        ttk.Label(hostf, text="Target host:").pack(side="left")
+        ttk.Entry(hostf, textvariable=self.install_host, width=30).pack(
+            side="left", padx=6)
+        ttk.Button(hostf, text="Use verified board",
+                   command=self._install_use_verified).pack(side="left", padx=4)
+        ttk.Label(hostf, text="(hostname or IP; SSH user/password come "
+                              "from the Configure tab)",
+                  foreground="#888").pack(side="left", padx=6)
+
+        # Steps
+        steps_frame = ttk.LabelFrame(wrap, text="Steps")
+        steps_frame.pack(fill="x", pady=8)
+        step_defs = [
+            ("Connect to CM4 over SSH",   "Uses the configured user / password."),
+            ("Transfer app zip",          "SCP the zip to /tmp on the CM4."),
+            ("Unzip the app",             "Extract into the home directory."),
+            ("Install dos2unix",          "apt install dos2unix."),
+            ("Fix line endings + perms",  "dos2unix + chmod +x on bin/ and etc/."),
+            ("Run setupSystemLocal.sh",   "The Carebloom system setup script."),
+        ]
+        self.install_steps = []
+        for label, sub in step_defs:
+            row = ttk.Frame(steps_frame)
+            row.pack(fill="x", padx=8, pady=2)
+            icon = ttk.Label(row, text="○", width=2, font=("DejaVu Sans Mono", 14))
+            icon.pack(side="left")
+            ttk.Label(row, text=label,
+                      font=("DejaVu Sans", 12, "bold")).pack(side="left", padx=4)
+            ttk.Label(row, text="— " + sub,
+                      foreground="#777").pack(side="left", padx=4)
+            self.install_steps.append({"icon": icon, "status": "pending"})
+
+        ctrl = ttk.Frame(wrap)
+        ctrl.pack(fill="x", pady=8)
+        self.install_btn = ttk.Button(ctrl, text="Install Application",
+                                      command=self._start_install_thread)
+        self.install_btn.pack(side="left", padx=4, ipadx=20, ipady=6)
+        ttk.Button(ctrl, text="Reset",
+                   command=self._reset_install_steps).pack(side="left", padx=4)
+
+        self.install_status = ttk.Label(wrap, text="Ready.",
+                                         font=("DejaVu Sans", 13))
+        self.install_status.pack(anchor="w", pady=6)
+
+        self.install_results = scrolledtext.ScrolledText(
+            wrap, height=14, wrap="word", font=("DejaVu Sans Mono", 10))
+        self.install_results.pack(fill="both", expand=True, pady=6)
+
+    def _install_use_verified(self):
+        """Populate the target host from the most recent verified board."""
+        ip = self.found_ip.get().strip()
+        host = self.found_host.get().strip()
+        target = host or ip
+        if target:
+            self.install_host.set(target)
+            self._iresult(f"Target set to: {target}")
+        else:
+            messagebox.showinfo(
+                "No verified board",
+                "Run the Verify tab first, or type a hostname/IP manually.")
+
+    def _set_install_step(self, idx, status):
+        glyph = {"pending": ("○", "#888"),
+                 "running": ("●", "#0a7"),
+                 "ok":      ("✓", "#080"),
+                 "fail":    ("✗", "#c00")}[status]
+        self.install_steps[idx]["status"] = status
+        self.install_steps[idx]["icon"].configure(
+            text=glyph[0], foreground=glyph[1])
+
+    def _reset_install_steps(self):
+        for i in range(len(self.install_steps)):
+            self._set_install_step(i, "pending")
+        self.install_status.configure(text="Ready.", foreground="#000")
+
+    def _iresult(self, s):
+        def upd():
+            self.install_results.insert("end", s + "\n")
+            self.install_results.see("end")
+        self.after(0, upd)
+
+
     def log(self, s):
         self._log_q.put(s)
 
@@ -533,6 +650,8 @@ class App(tk.Tk):
             "hostname": self.hostname.get(),
             "wifi_ssid": self.wifi_ssid.get(),
             "wifi_country": self.wifi_country.get(),
+            "app_zip_path": self.app_zip_path.get(),
+            "app_name": self.app_name.get(),
             # passwords intentionally NOT saved
         }
         try:
@@ -1201,6 +1320,236 @@ class App(tk.Tk):
             time.sleep(5)
         return None, ""
 
+    # ---- App installation workflow ----------------------------------------
+    def _start_install_thread(self):
+        problems = []
+        zip_path = self.app_zip_path.get().strip()
+        if not zip_path or not os.path.isfile(zip_path):
+            problems.append("App zip not found (set it on the Configure tab)")
+        if not zip_path.lower().endswith(".zip"):
+            problems.append("App file must be a .zip")
+        if not self.app_name.get().strip():
+            problems.append("App folder name is empty (e.g. CARE001)")
+        if not self.install_host.get().strip():
+            problems.append("Target host is empty")
+        if not self.username.get().strip():
+            problems.append("Username is empty (Configure tab)")
+        if not self.password.get():
+            problems.append("Password is empty (Configure tab)")
+        if paramiko is None:
+            problems.append("paramiko not installed")
+        if problems:
+            messagebox.showerror("Fix before installing", "\n".join(problems))
+            return
+
+        self._reset_install_steps()
+        self.install_results.delete("1.0", "end")
+        self.install_btn.configure(state="disabled")
+        self.install_status.configure(text="Installing...", foreground="#0a7")
+        threading.Thread(target=self._install_workflow, daemon=True).start()
+
+    def _install_workflow(self):
+        ok = False
+        try:
+            ok = self._do_install()
+        except Exception as e:
+            self._iresult(f"EXCEPTION: {e}")
+        finally:
+            def finish():
+                self.install_btn.configure(state="normal")
+                if ok:
+                    self.install_status.configure(
+                        text="✓ Application installed successfully.",
+                        foreground="#080")
+                else:
+                    self.install_status.configure(
+                        text="✗ Installation failed — see output above.",
+                        foreground="#c00")
+            self.after(0, finish)
+
+    def _ssh_exec(self, client, cmd, label=None, sudo=False, get_pty=False):
+        """Run a command over an open SSH client. If sudo=True, runs via
+        'sudo -S' and feeds the password on stdin. Streams output to the
+        install results pane. Returns the exit status."""
+        pw = self.password.get()
+        if sudo:
+            # -S reads password from stdin, -p '' suppresses the prompt text
+            full = f"sudo -S -p '' bash -c {shlex.quote(cmd)}"
+        else:
+            full = cmd
+        if label:
+            self._iresult(f"--- {label} ---")
+        self._iresult(f"$ {cmd}")
+        stdin, stdout, stderr = client.exec_command(full, get_pty=get_pty,
+                                                     timeout=600)
+        if sudo:
+            try:
+                stdin.write(pw + "\n")
+                stdin.flush()
+            except Exception:
+                pass
+        # Stream stdout live
+        for line in iter(stdout.readline, ""):
+            if not line:
+                break
+            self._iresult(line.rstrip())
+        err = stderr.read().decode(errors="replace").rstrip()
+        # Filter the sudo password echo / blank lines out of stderr
+        if err:
+            for eline in err.splitlines():
+                if eline.strip() and "[sudo] password" not in eline:
+                    self._iresult("[stderr] " + eline)
+        rc = stdout.channel.recv_exit_status()
+        if rc != 0:
+            self._iresult(f"[exit {rc}]")
+        return rc
+
+    def _do_install(self):
+        host = self.install_host.get().strip()
+        user = self.username.get().strip()
+        pw = self.password.get()
+        zip_path = self.app_zip_path.get().strip()
+        app_name = self.app_name.get().strip()
+        zip_name = os.path.basename(zip_path)
+        remote_zip = f"/tmp/{zip_name}"
+        # Where the app unzips to. We extract in the user's home directory,
+        # so the app folder ends up at ~/<app_name> (e.g. /home/pi/CARE001).
+        remote_home = f"/home/{user}"
+        app_dir = f"{remote_home}/{app_name}"
+
+        # STEP 1: SSH connect
+        self._set_install_step(0, "running")
+        self._iresult(f"Connecting to {user}@{host} ...")
+        client = None
+        last_err = None
+        for attempt in range(4):
+            try:
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                client.connect(hostname=host, username=user, password=pw,
+                               timeout=10, allow_agent=False,
+                               look_for_keys=False)
+                break
+            except Exception as e:
+                last_err = e
+                self._iresult(f"  attempt {attempt+1} failed: {e}")
+                time.sleep(5)
+                client = None
+        if client is None:
+            self._iresult(f"Could not connect: {last_err}")
+            self._set_install_step(0, "fail")
+            return False
+        self._iresult("SSH connected.")
+        self._set_install_step(0, "ok")
+
+        try:
+            # STEP 2: SCP the zip to /tmp
+            self._set_install_step(1, "running")
+            self._iresult(f"--- Transferring {zip_name} to {remote_zip} ---")
+            try:
+                size = os.path.getsize(zip_path)
+                sftp = client.open_sftp()
+                last_pct = [-1]
+                def progress(sent, total):
+                    pct = int(sent * 100 / total) if total else 0
+                    if pct != last_pct[0] and pct % 10 == 0:
+                        last_pct[0] = pct
+                        self._iresult(f"  {pct}%  ({sent}/{total} bytes)")
+                sftp.put(zip_path, remote_zip, callback=progress)
+                sftp.close()
+                self._iresult(f"Transfer complete ({size} bytes).")
+            except Exception as e:
+                self._iresult(f"SCP failed: {e}")
+                self._set_install_step(1, "fail")
+                return False
+            self._set_install_step(1, "ok")
+
+            # STEP 3: unzip into the home directory
+            self._set_install_step(2, "running")
+            # -o overwrite without prompting; -d extract dir
+            rc = self._ssh_exec(
+                client,
+                f"cd {shlex.quote(remote_home)} && "
+                f"unzip -o {shlex.quote(remote_zip)}",
+                label=f"Unzipping into {remote_home}")
+            if rc != 0:
+                # unzip may be missing on a Lite image
+                self._iresult("unzip failed - attempting to install it...")
+                self._ssh_exec(client,
+                               "DEBIAN_FRONTEND=noninteractive apt-get install -y unzip",
+                               label="Install unzip", sudo=True)
+                rc = self._ssh_exec(
+                    client,
+                    f"cd {shlex.quote(remote_home)} && "
+                    f"unzip -o {shlex.quote(remote_zip)}",
+                    label="Unzipping (retry)")
+            if rc != 0:
+                self._set_install_step(2, "fail")
+                return False
+            # Sanity-check the app folder exists
+            rc = self._ssh_exec(
+                client, f"test -d {shlex.quote(app_dir)}",
+                label=f"Checking {app_dir} exists")
+            if rc != 0:
+                self._iresult(
+                    f"ERROR: expected folder {app_dir} not found after unzip. "
+                    f"Check the 'App folder name' on the Configure tab.")
+                self._set_install_step(2, "fail")
+                return False
+            self._set_install_step(2, "ok")
+
+            # STEP 4: apt install dos2unix
+            self._set_install_step(3, "running")
+            rc = self._ssh_exec(
+                client,
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y dos2unix",
+                label="apt install dos2unix", sudo=True)
+            if rc != 0:
+                self._iresult("dos2unix install failed - is the CM4 online?")
+                self._set_install_step(3, "fail")
+                return False
+            self._set_install_step(3, "ok")
+
+            # STEP 5: dos2unix + chmod on bin/ and etc/
+            self._set_install_step(4, "running")
+            # Run all four operations; bin/* and etc/* get dos2unix + chmod +x.
+            # (etc only chmods *.sh, matching the original manual procedure.)
+            fixcmd = (
+                f"cd {shlex.quote(app_dir)} && "
+                f"dos2unix ./bin/* && "
+                f"chmod +x ./bin/* && "
+                f"dos2unix ./etc/* && "
+                f"chmod +x ./etc/*.sh"
+            )
+            rc = self._ssh_exec(client, fixcmd,
+                                label="Fix line endings + permissions",
+                                sudo=True)
+            if rc != 0:
+                self._set_install_step(4, "fail")
+                return False
+            self._set_install_step(4, "ok")
+
+            # STEP 6: run setupSystemLocal.sh
+            self._set_install_step(5, "running")
+            setup_script = f"{app_dir}/bin/setupSystemLocal.sh"
+            rc = self._ssh_exec(
+                client,
+                f"cd {shlex.quote(app_dir)} && {shlex.quote(setup_script)}",
+                label="Running setupSystemLocal.sh", sudo=True, get_pty=True)
+            if rc != 0:
+                self._iresult(f"setupSystemLocal.sh exited with code {rc}.")
+                self._set_install_step(5, "fail")
+                return False
+            self._set_install_step(5, "ok")
+
+            self._iresult("\n=== Application installed successfully ===")
+            return True
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
 
 def main():
     App().mainloop()
@@ -1208,4 +1557,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
