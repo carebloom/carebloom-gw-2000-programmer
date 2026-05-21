@@ -114,16 +114,20 @@ def find_cm4_disk():
     Strict rules so we never write to the wrong disk:
       - Type 'disk' (not a partition, not a loop, not the host's root)
       - Transport USB (rpiboot exposes the eMMC over USB)
-      - Hot-pluggable
+      - Marked removable (rm == true)
       - Size between 1 GB and 64 GB
       - Not the device backing the running root filesystem
+
+    NOTE: we deliberately do NOT require the 'hotplug' flag. The rpiboot
+    mass-storage gadget reports hotplug=false even though the eMMC is a
+    removable USB device, so requiring hotplug would (and did) miss it.
     """
     # Find the root device so we exclude it.
     root_dev = ""
     try:
         out = subprocess.check_output(["findmnt", "-n", "-o", "SOURCE", "/"],
                                        text=True).strip()
-        # Strip partition suffix (e.g. /dev/mmcblk0p2 → /dev/mmcblk0, /dev/sda1 → /dev/sda)
+        # Strip partition suffix (e.g. /dev/mmcblk0p2 -> /dev/mmcblk0, /dev/sda1 -> /dev/sda)
         root_dev = re.sub(r"p?\d+$", "", out)
     except Exception:
         pass
@@ -138,7 +142,8 @@ def find_cm4_disk():
             continue
         if d.get("tran") != "usb":
             continue
-        if not d.get("hotplug"):
+        # Must be flagged removable. The rpiboot eMMC gadget reports rm=true.
+        if not d.get("rm"):
             continue
         try:
             size = int(d.get("size") or 0)
@@ -1123,3 +1128,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
