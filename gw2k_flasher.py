@@ -1429,7 +1429,8 @@ class App(tk.Tk):
                 self.install_btn.configure(state="normal")
                 if ok:
                     self.install_status.configure(
-                        text="✓ Application installed successfully.",
+                        text="✓ Application installed — GW2000 is rebooting "
+                             "(~60-90 s).",
                         foreground="#080")
                 else:
                     self.install_status.configure(
@@ -1750,6 +1751,34 @@ class App(tk.Tk):
             self._set_install_step(5, "ok")
 
             self._iresult("\n=== Application installed successfully ===")
+
+            # setupSystemLocal.sh ends with "Please reboot the system..." -
+            # the Carebloom services only come up after a reboot. Trigger it
+            # now. The reboot drops the SSH connection, so we issue it in the
+            # background on the target and don't wait for an exit status
+            # (there won't be one - the link dies first).
+            self._iresult("")
+            self._iresult("Rebooting the GW2000 to start the Carebloom "
+                          "services...")
+            try:
+                # 'sleep 2' lets our exec call return cleanly before the box
+                # goes down; nohup + & detaches it from the dying SSH session.
+                rb = ("sudo -S -p '' bash -c "
+                      + shlex.quote("nohup sh -c 'sleep 2; reboot' "
+                                    ">/dev/null 2>&1 &"))
+                stdin, stdout, stderr = client.exec_command(rb, timeout=10)
+                try:
+                    stdin.write(self.password.get() + "\n")
+                    stdin.flush()
+                except Exception:
+                    pass
+                self._iresult("Reboot command sent. The GW2000 will be "
+                              "back up in ~60-90 seconds.")
+            except Exception as e:
+                # Not fatal - the install itself succeeded.
+                self._iresult(f"(Could not send reboot command: {e})")
+                self._iresult("Please reboot the GW2000 manually to start "
+                              "the Carebloom services.")
             return True
         finally:
             try:
@@ -1764,3 +1793,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
