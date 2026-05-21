@@ -1450,10 +1450,13 @@ class App(tk.Tk):
         'sudo -S' and feeds the password on stdin. Streams output to the
         install results pane. Returns the exit status.
 
-        If watch_errors=True, scans every output line for tell-tale failure
-        patterns (cp: cannot stat, No such file, Failed to enable unit, etc.)
-        and appends them to self._install_saw_errors. This is needed because
-        setupSystemLocal.sh exits 0 even when its internal steps fail."""
+        Reads the raw channel (not stdout.readline) because apt/dpkg emit
+        progress bars terminated by carriage returns, not newlines -
+        readline() would block forever waiting for a '\\n'. We also pull
+        stdout and stderr together to avoid a pipe-buffer deadlock.
+
+        If watch_errors=True, scans output for genuine failure markers and
+        appends them to self._install_saw_errors."""
         pw = self.password.get()
         if sudo:
             # -S reads password from stdin, -p '' suppresses the prompt text
@@ -1463,22 +1466,22 @@ class App(tk.Tk):
         if label:
             self._iresult(f"--- {label} ---")
         self._iresult(f"$ {cmd}")
-        stdin, stdout, stderr = client.exec_command(full, get_pty=get_pty,
-                                                     timeout=600)
+
+        # Open a session channel directly so we control PTY size and reads.
+        chan = client.get_transport().open_session(timeout=30)
+        if get_pty:
+            # Give dpkg/apt a real terminal size so they don't stall or
+            # emit zero-width progress bars.
+            chan.get_pty(term="xterm", width=120, height=40)
+        chan.settimeout(None)
+        chan.exec_command(full)
+
         if sudo:
             try:
-                stdin.write(pw + "\n")
-                stdin.flush()
+                chan.sendall(pw + "\n")
             except Exception:
                 pass
 
-        # Patterns that indicate a GENUINE failure even if the script exits 0.
-        # NOTE: setupSystemLocal.sh is sloppy - on a clean first run it emits
-        # benign 'mv: cannot stat ...' and 'dos2unix: ... No such file' lines
-        # for files it is about to create. A manual run that produced those
-        # exact lines still installed correctly. So we do NOT treat bare
-        # 'cannot stat' / 'No such file' as failures. We only flag the markers
-        # that distinguished the genuinely-broken run from the working one.
         error_patterns = (
             "Failed to enable unit",        # service file genuinely missing
             "command not found",
@@ -1488,8 +1491,6 @@ class App(tk.Tk):
             "Could not open lock file",     # ran without sudo
             "are you root",
         )
-        # Lines we explicitly IGNORE even though they look error-ish - these
-        # are the known-benign first-run noise from setupSystemLocal.sh.
         benign_substrings = (
             "mv: cannot stat",
             "dos2unix:",
@@ -1509,21 +1510,68 @@ class App(tk.Tk):
                     self._install_saw_errors.append(line.strip())
                     break
 
-        # Stream stdout live
-        for line in iter(stdout.readline, ""):
+        def emit(line):
+            line = line.rstrip()
             if not line:
-                break
-            stripped = line.rstrip()
-            self._iresult(stripped)
-            check(stripped)
-        err = stderr.read().decode(errors="replace").rstrip()
-        # Filter the sudo password echo / blank lines out of stderr
-        if err:
-            for eline in err.splitlines():
-                if eline.strip() and "[sudo] password" not in eline:
-                    self._iresult("[stderr] " + eline)
-                    check(eline)
-        rc = stdout.channel.recv_exit_status()
+                return
+            # With a PTY, the password we send on stdin is echoed back by
+            # the terminal. Don't print it to the transcript.
+            if sudo and line.strip() == pw.strip():
+                return
+            if "[sudo] password" in line:
+                return
+            self._iresult(line)
+            check(line)
+
+        # Read raw bytes from both stdout and stderr until the command exits.
+        # Split on \r and \n so apt/dpkg progress bars become discrete lines.
+        buf = ""
+        last_activity = time.time()
+        STALL_LIMIT = 900  # 15 min with zero output => assume hung
+        while True:
+            got_data = False
+            if chan.recv_ready():
+                data = chan.recv(65536).decode(errors="replace")
+                if data:
+                    buf += data
+                    got_data = True
+            if chan.recv_stderr_ready():
+                data = chan.recv_stderr(65536).decode(errors="replace")
+                if data:
+                    buf += data
+                    got_data = True
+
+            # Split out complete lines on either terminator.
+            while True:
+                idx = min(
+                    [i for i in (buf.find("\n"), buf.find("\r")) if i >= 0],
+                    default=-1)
+                if idx < 0:
+                    break
+                emit(buf[:idx])
+                buf = buf[idx + 1:]
+
+            if got_data:
+                last_activity = time.time()
+            else:
+                if chan.exit_status_ready() and not chan.recv_ready() \
+                        and not chan.recv_stderr_ready():
+                    break
+                if time.time() - last_activity > STALL_LIMIT:
+                    self._iresult(f"[no output for {STALL_LIMIT}s - "
+                                  f"assuming the remote command hung]")
+                    try:
+                        chan.close()
+                    except Exception:
+                        pass
+                    return 124  # timeout-style exit code
+                time.sleep(0.1)
+
+        # Flush any trailing partial line.
+        if buf.strip():
+            emit(buf)
+
+        rc = chan.recv_exit_status()
         if rc != 0:
             self._iresult(f"[exit {rc}]")
         return rc
@@ -1536,10 +1584,14 @@ class App(tk.Tk):
         app_name = self.app_name.get().strip()
         zip_name = os.path.basename(zip_path)
         remote_zip = f"/tmp/{zip_name}"
-        # Where the app unzips to. We extract in the user's home directory,
-        # so the app folder ends up at ~/<app_name> (e.g. /home/pi/CARE001).
-        remote_home = f"/home/{user}"
-        app_dir = f"{remote_home}/{app_name}"
+        # IMPORTANT: setupSystemLocal.sh contains a hard-coded 'cd /tmp' and
+        # then uses relative paths (cp CARE001/etc/..., cp -r CARE001 ...).
+        # So the app folder MUST be extracted into /tmp - that is the only
+        # place the script will find it. (This is why a manual run from /tmp
+        # worked but runs from /home/pi failed.) We extract into /tmp and
+        # the app folder ends up at /tmp/<app_name> e.g. /tmp/CARE001.
+        extract_dir = "/tmp"
+        app_dir = f"{extract_dir}/{app_name}"
 
         # STEP 1: SSH connect
         self._set_install_step(0, "running")
@@ -1588,7 +1640,7 @@ class App(tk.Tk):
                 return False
             self._set_install_step(1, "ok")
 
-            # STEP 3: extract into the home directory
+            # STEP 3: extract into /tmp (where setupSystemLocal.sh expects it)
             self._set_install_step(2, "running")
             low = zip_path.lower()
             is_tar = low.endswith((".tar.gz", ".tgz", ".tar"))
@@ -1596,19 +1648,19 @@ class App(tk.Tk):
                 # tar handles .gz automatically with -z; works for plain .tar too.
                 # tar is always present on Pi OS, so no fallback install needed.
                 extract_cmd = (
-                    f"cd {shlex.quote(remote_home)} && "
+                    f"cd {shlex.quote(extract_dir)} && "
                     f"tar -xzf {shlex.quote(remote_zip)} 2>/dev/null || "
                     f"tar -xf {shlex.quote(remote_zip)}"
                 )
                 rc = self._ssh_exec(client, extract_cmd,
-                                    label=f"Extracting tarball into {remote_home}")
+                                    label=f"Extracting tarball into {extract_dir}")
             else:
                 # .zip path
                 rc = self._ssh_exec(
                     client,
-                    f"cd {shlex.quote(remote_home)} && "
+                    f"cd {shlex.quote(extract_dir)} && "
                     f"unzip -o {shlex.quote(remote_zip)}",
-                    label=f"Unzipping into {remote_home}")
+                    label=f"Unzipping into {extract_dir}")
                 if rc != 0:
                     # unzip may be missing on a Lite image
                     self._iresult("unzip failed - attempting to install it...")
@@ -1618,7 +1670,7 @@ class App(tk.Tk):
                         label="Install unzip", sudo=True)
                     rc = self._ssh_exec(
                         client,
-                        f"cd {shlex.quote(remote_home)} && "
+                        f"cd {shlex.quote(extract_dir)} && "
                         f"unzip -o {shlex.quote(remote_zip)}",
                         label="Unzipping (retry)")
             if rc != 0:
@@ -1671,17 +1723,16 @@ class App(tk.Tk):
 
             # STEP 6: run setupSystemLocal.sh
             self._set_install_step(5, "running")
-            # IMPORTANT: setupSystemLocal.sh uses RELATIVE paths like
-            # 'cp CARE001/etc/...'. It must be run from the PARENT of the app
-            # folder (the home directory), exactly as the manual procedure did
-            # ('./CARE001/bin/setupSystemLocal.sh' from ~). Running it from
-            # inside the app folder doubles the path (CARE001/CARE001/...) and
-            # every cp fails.
+            # setupSystemLocal.sh contains a hard-coded 'cd /tmp' near the top
+            # and then uses relative paths (cp CARE001/etc/..., cp -r CARE001
+            # ...). The CARE001 folder must therefore live in /tmp. We extract
+            # there (extract_dir) and launch the script from /tmp too, exactly
+            # matching the manual procedure that worked.
             setup_script = f"./{app_name}/bin/setupSystemLocal.sh"
             self._install_saw_errors = []
             rc = self._ssh_exec(
                 client,
-                f"cd {shlex.quote(remote_home)} && {setup_script}",
+                f"cd {shlex.quote(extract_dir)} && {setup_script}",
                 label="Running setupSystemLocal.sh", sudo=True, get_pty=True,
                 watch_errors=True)
             # setupSystemLocal.sh does not 'set -e' - it exits 0 even when cp /
