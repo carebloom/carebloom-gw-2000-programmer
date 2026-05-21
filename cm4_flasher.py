@@ -1396,20 +1396,40 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-        # Patterns that indicate a step failed even if the script exits 0.
+        # Patterns that indicate a GENUINE failure even if the script exits 0.
+        # NOTE: setupSystemLocal.sh is sloppy - on a clean first run it emits
+        # benign 'mv: cannot stat ...' and 'dos2unix: ... No such file' lines
+        # for files it is about to create. A manual run that produced those
+        # exact lines still installed correctly. So we do NOT treat bare
+        # 'cannot stat' / 'No such file' as failures. We only flag the markers
+        # that distinguished the genuinely-broken run from the working one.
         error_patterns = (
-            "cannot stat", "No such file or directory",
-            "Failed to enable unit", "command not found",
-            "Permission denied", "error:", "cannot access",
-            "cannot create", "cannot open",
+            "Failed to enable unit",        # service file genuinely missing
+            "command not found",
+            "Unit file .* does not exist",
+            "is not a directory",
+            "Read-only file system",
+            "Could not open lock file",     # ran without sudo
+            "are you root",
+        )
+        # Lines we explicitly IGNORE even though they look error-ish - these
+        # are the known-benign first-run noise from setupSystemLocal.sh.
+        benign_substrings = (
+            "mv: cannot stat",
+            "dos2unix:",
+            "Skipping",
+            "Binary symbol",
         )
 
         def check(line):
             if not watch_errors:
                 return
             low = line.lower()
+            for b in benign_substrings:
+                if b.lower() in low:
+                    return
             for pat in error_patterns:
-                if pat.lower() in low:
+                if re.search(pat, line, re.I):
                     self._install_saw_errors.append(line.strip())
                     break
 
