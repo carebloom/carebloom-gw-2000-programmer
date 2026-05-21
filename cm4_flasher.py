@@ -817,12 +817,29 @@ class App(tk.Tk):
             f'        sed -i "s/^pi /{user} /" /etc/sudoers.d/010_{user}-nopasswd',
             "    fi",
             "fi",
-            "# Set the password (hash was generated with openssl passwd -6).",
-            f'if echo "{user}:{pw_hash}" | chpasswd -e; then',
-            f'    echo "password set OK for user {user}"',
+            "# Set the password. The SHA-512 hash ($6$...) is read from a",
+            "# separate file (cm4_pwhash) rather than embedded inline, because",
+            "# a $6$... hash inside a shell string gets mangled by variable",
+            "# expansion. 'chpasswd -e' takes 'user:hash' on stdin.",
+            "PWHASH=''",
+            "for HF in /boot/firmware/cm4_pwhash /boot/cm4_pwhash; do",
+            '    if [ -r "$HF" ]; then',
+            '        PWHASH=$(cat "$HF")',
+            "        break",
+            "    fi",
+            "done",
+            'if [ -n "$PWHASH" ]; then',
+            f'    if printf "%s:%s\\n" {shlex.quote(user)} "$PWHASH" | chpasswd -e; then',
+            f'        echo "password set OK for user {user}"',
+            "    else",
+            f'        echo "ERROR: chpasswd failed for user {user}" >&2',
+            "    fi",
             "else",
-            f'    echo "ERROR: chpasswd failed for user {user}" >&2',
+            '    echo "ERROR: password hash file not found" >&2',
             "fi",
+            "# Remove the hash file so the password hash is not left on the",
+            "# boot partition after first boot.",
+            "rm -f /boot/firmware/cm4_pwhash /boot/cm4_pwhash 2>/dev/null || true",
             "# Make sure the account is not locked.",
             f'passwd -u {shlex.quote(user)} 2>/dev/null || true',
             "",
@@ -878,6 +895,16 @@ class App(tk.Tk):
             os.unlink(tmp)
 
             run_stream(["sudo", "touch", os.path.join(bootfs, "ssh")], self.log)
+
+            # Write the password hash to its own file (NOT interpolated into
+            # firstrun.sh, because a $6$... hash gets mangled by shell
+            # variable expansion). firstrun.sh reads this and deletes it.
+            pwhash_path = os.path.join(bootfs, "cm4_pwhash")
+            tmph = "/tmp/cm4_pwhash"
+            with open(tmph, "w") as f:
+                f.write(pw_hash + "\n")
+            run_stream(["sudo", "install", "-m", "0600", tmph, pwhash_path], self.log)
+            os.unlink(tmph)
 
             cmdline_path = os.path.join(bootfs, "cmdline.txt")
             with open(cmdline_path) as f:
@@ -1151,3 +1178,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
