@@ -1368,10 +1368,16 @@ class App(tk.Tk):
                         foreground="#c00")
             self.after(0, finish)
 
-    def _ssh_exec(self, client, cmd, label=None, sudo=False, get_pty=False):
+    def _ssh_exec(self, client, cmd, label=None, sudo=False, get_pty=False,
+                  watch_errors=False):
         """Run a command over an open SSH client. If sudo=True, runs via
         'sudo -S' and feeds the password on stdin. Streams output to the
-        install results pane. Returns the exit status."""
+        install results pane. Returns the exit status.
+
+        If watch_errors=True, scans every output line for tell-tale failure
+        patterns (cp: cannot stat, No such file, Failed to enable unit, etc.)
+        and appends them to self._install_saw_errors. This is needed because
+        setupSystemLocal.sh exits 0 even when its internal steps fail."""
         pw = self.password.get()
         if sudo:
             # -S reads password from stdin, -p '' suppresses the prompt text
@@ -1389,17 +1395,38 @@ class App(tk.Tk):
                 stdin.flush()
             except Exception:
                 pass
+
+        # Patterns that indicate a step failed even if the script exits 0.
+        error_patterns = (
+            "cannot stat", "No such file or directory",
+            "Failed to enable unit", "command not found",
+            "Permission denied", "error:", "cannot access",
+            "cannot create", "cannot open",
+        )
+
+        def check(line):
+            if not watch_errors:
+                return
+            low = line.lower()
+            for pat in error_patterns:
+                if pat.lower() in low:
+                    self._install_saw_errors.append(line.strip())
+                    break
+
         # Stream stdout live
         for line in iter(stdout.readline, ""):
             if not line:
                 break
-            self._iresult(line.rstrip())
+            stripped = line.rstrip()
+            self._iresult(stripped)
+            check(stripped)
         err = stderr.read().decode(errors="replace").rstrip()
         # Filter the sudo password echo / blank lines out of stderr
         if err:
             for eline in err.splitlines():
                 if eline.strip() and "[sudo] password" not in eline:
                     self._iresult("[stderr] " + eline)
+                    check(eline)
         rc = stdout.channel.recv_exit_status()
         if rc != 0:
             self._iresult(f"[exit {rc}]")
@@ -1548,13 +1575,36 @@ class App(tk.Tk):
 
             # STEP 6: run setupSystemLocal.sh
             self._set_install_step(5, "running")
-            setup_script = f"{app_dir}/bin/setupSystemLocal.sh"
+            # IMPORTANT: setupSystemLocal.sh uses RELATIVE paths like
+            # 'cp CARE001/etc/...'. It must be run from the PARENT of the app
+            # folder (the home directory), exactly as the manual procedure did
+            # ('./CARE001/bin/setupSystemLocal.sh' from ~). Running it from
+            # inside the app folder doubles the path (CARE001/CARE001/...) and
+            # every cp fails.
+            setup_script = f"./{app_name}/bin/setupSystemLocal.sh"
+            self._install_saw_errors = []
             rc = self._ssh_exec(
                 client,
-                f"cd {shlex.quote(app_dir)} && {shlex.quote(setup_script)}",
-                label="Running setupSystemLocal.sh", sudo=True, get_pty=True)
+                f"cd {shlex.quote(remote_home)} && {setup_script}",
+                label="Running setupSystemLocal.sh", sudo=True, get_pty=True,
+                watch_errors=True)
+            # setupSystemLocal.sh does not 'set -e' - it exits 0 even when cp /
+            # systemctl steps fail. So a 0 exit code is NOT proof of success.
+            # We scan its output for tell-tale failure lines.
             if rc != 0:
                 self._iresult(f"setupSystemLocal.sh exited with code {rc}.")
+                self._set_install_step(5, "fail")
+                return False
+            if self._install_saw_errors:
+                self._iresult("")
+                self._iresult("WARNING: setupSystemLocal.sh exited 0 but its "
+                              "output contained failures:")
+                for e in self._install_saw_errors[:20]:
+                    self._iresult("  " + e)
+                self._iresult("")
+                self._iresult("The Carebloom app did NOT install cleanly. "
+                              "This is a problem inside setupSystemLocal.sh "
+                              "(it does not stop on errors), not the flasher.")
                 self._set_install_step(5, "fail")
                 return False
             self._set_install_step(5, "ok")
@@ -1574,3 +1624,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
