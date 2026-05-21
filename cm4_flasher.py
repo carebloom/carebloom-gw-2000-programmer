@@ -1077,35 +1077,46 @@ class App(tk.Tk):
         return h
 
     def _find_board_by_mac(self, hostname_template, deadline):
-        """Find the freshly-flashed board on the LAN. Returns (ip, hostname)
-        where hostname is the predicted hostname if we know the MAC, else
-        an empty string.
+        """Find the freshly-flashed board on the LAN. Returns (ip, hostname).
 
-        Strategy:
-          1. Try mDNS for any plausible hostname pattern (helps if a previous
-             board with same template is still on the LAN — we'll skip and
-             match by MAC).
-          2. Ping-sweep + ARP, match Pi MAC OUI, return the IP of the first
-             we haven't seen before (we track 'baseline' hosts at start).
+        The board names itself from its own eth0 MAC using hostname_template
+        (e.g. 'Carebloom{MAC}'). We do NOT try to guess which host is 'new' -
+        that breaks when re-flashing a board that's been on the LAN before.
+        Instead we find the static prefix of the template (the part before
+        the first {...} token, e.g. 'Carebloom') and look for any host whose
+        mDNS hostname starts with that prefix.
+
+        Strategy, in order:
+          1. Try direct mDNS resolution of the prefix as a wildcard isn't
+             possible, so we ping-sweep, collect Pi-MAC hosts, and for each
+             one resolve its hostname (reverse mDNS / avahi) and check the
+             prefix.
+          2. If avahi-resolve of an IP doesn't yield a name, predict the
+             hostname from the MAC and try forward resolution to confirm.
         """
-        # 1. Snapshot the LAN BEFORE the new board comes up so we can
-        #    distinguish the new one from existing Pi-MAC hosts.
-        baseline = set()
-        try:
-            arp = subprocess.check_output(["ip", "neigh", "show"], text=True)
-            for line in arp.splitlines():
-                m = re.match(r"^(\d+\.\d+\.\d+\.\d+)\s.*\s([0-9a-f:]{17})",
-                              line, re.I)
-                if m and any(m.group(2).lower().startswith(o)
-                              for o in PI_MAC_PREFIXES):
-                    baseline.add(m.group(2).lower())
-        except Exception:
-            pass
-        if baseline:
-            self._result(f"Already-known Pi-MAC hosts on LAN: {len(baseline)}"
-                          " (will skip these)")
+        # Static prefix of the template = everything before the first '{'.
+        prefix = hostname_template.split("{")[0]
+        prefix_l = prefix.lower()
+        self._result(f"Looking for any host whose name starts with '{prefix}'")
 
-        # 2. Repeated sweep loop
+        def resolve_ip_to_name(ip):
+            """Reverse-resolve an IP to a hostname via avahi, then DNS."""
+            if which("avahi-resolve"):
+                try:
+                    out = subprocess.check_output(
+                        ["avahi-resolve", "-a", ip],
+                        text=True, stderr=subprocess.DEVNULL, timeout=5)
+                    parts = out.split()
+                    if len(parts) >= 2:
+                        return parts[1].split(".")[0]
+                except Exception:
+                    pass
+            try:
+                name = socket.gethostbyaddr(ip)[0]
+                return name.split(".")[0]
+            except Exception:
+                return ""
+
         while time.time() < deadline:
             for net in local_subnets():
                 try:
@@ -1115,7 +1126,7 @@ class App(tk.Tk):
                 hosts = list(network.hosts())
                 if len(hosts) > 512:
                     continue
-                self._result(f"Scanning {net} ({len(hosts)} hosts)…")
+                self._result(f"Scanning {net} ({len(hosts)} hosts)...")
                 threads = []
                 for ip in hosts:
                     t = threading.Thread(
@@ -1132,42 +1143,61 @@ class App(tk.Tk):
                         threads = []
                 for tt in threads:
                     tt.join()
+
                 try:
                     arp = subprocess.check_output(
                         ["ip", "neigh", "show"], text=True)
                 except Exception:
                     arp = ""
+
+                pi_hosts = []
                 for line in arp.splitlines():
-                    m = re.match(r"^(\d+\.\d+\.\d+\.\d+)\s.*\s([0-9a-f:]{17})",
-                                  line, re.I)
+                    m = re.match(
+                        r"^(\d+\.\d+\.\d+\.\d+)\s.*\s([0-9a-f:]{17})",
+                        line, re.I)
                     if not m:
                         continue
                     ip, mac = m.group(1), m.group(2).lower()
-                    if not any(mac.startswith(o) for o in PI_MAC_PREFIXES):
-                        continue
-                    if mac in baseline:
-                        continue
-                    # New Pi host! Predict the hostname.
+                    if any(mac.startswith(o) for o in PI_MAC_PREFIXES):
+                        pi_hosts.append((ip, mac))
+
+                if pi_hosts:
+                    self._result(f"Pi-MAC hosts found: {len(pi_hosts)} - "
+                                  "resolving hostnames...")
+
+                for ip, mac in pi_hosts:
+                    # First: what the board *should* be named, from its MAC.
                     mac_no_colons = mac.replace(":", "")
                     predicted = self._expected_hostname_from_mac(
                         hostname_template, mac_no_colons)
-                    self.found_mac = mac
-                    self._result(
-                        f"NEW Pi-MAC host: {ip} ({mac}) → predicted hostname: "
-                        f"{predicted}")
-                    # Try mDNS to confirm
-                    try:
-                        if which("avahi-resolve"):
-                            out = subprocess.check_output(
-                                ["avahi-resolve", "-n", f"{predicted}.local"],
-                                text=True, stderr=subprocess.DEVNULL, timeout=5)
-                            m2 = re.search(r"\s(\d+\.\d+\.\d+\.\d+)", out)
-                            if m2:
-                                self._result(
-                                    f"mDNS confirms {predicted}.local → {m2.group(1)}")
-                    except Exception:
-                        pass
-                    return ip, predicted
+
+                    # Resolve the host's actual name.
+                    actual = resolve_ip_to_name(ip)
+
+                    matched = False
+                    if actual and actual.lower().startswith(prefix_l):
+                        matched = True
+                        name = actual
+                    elif predicted.lower().startswith(prefix_l):
+                        # Confirm the predicted name resolves to this IP.
+                        try:
+                            resolved = socket.gethostbyname(
+                                f"{predicted}.local")
+                            if resolved == ip:
+                                matched = True
+                                name = predicted
+                        except Exception:
+                            pass
+
+                    if matched:
+                        self.found_mac = mac
+                        self._result(
+                            f"MATCH: {ip} ({mac}) -> hostname: {name}")
+                        return ip, name
+                    else:
+                        self._result(
+                            f"  {ip} ({mac}) name='{actual or '?'}' "
+                            f"predicted='{predicted}' - no prefix match")
             time.sleep(5)
         return None, ""
 
