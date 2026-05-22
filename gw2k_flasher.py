@@ -50,7 +50,7 @@ DEFAULT_BOOTFILES_SUBDIR = "mass-storage-gadget64"
 DEFAULT_IMAGES_DIR = str(Path.home() / "gw2k-images")
 DEFAULT_USERNAME = "pi"
 DEFAULT_PASSWORD = "raspberry"
-DEFAULT_HOSTNAME = "Carebloom{MAC}"   # {MAC} replaced with eth0 MAC at first boot
+DEFAULT_HOSTNAME = "carebloom{MAC}"   # {MAC} replaced with eth0 MAC at first boot
 
 # Carebloom application installation
 DEFAULT_APP_NAME = "CARE001"          # top-level folder name inside the app zip
@@ -942,7 +942,7 @@ class App(tk.Tk):
         #   {MACUPPER}— full MAC, uppercase, no colons
         # Default template if user left it blank or set 'auto':
         if not host_template or host_template.endswith("auto"):
-            host_template = "Carebloom{MAC}"
+            host_template = "carebloom{MAC}"
         # If the operator typed plain text, leave it alone (no MAC injection).
 
         firstrun = [
@@ -1267,7 +1267,7 @@ class App(tk.Tk):
         """Find the freshly-flashed board on the LAN. Returns (ip, hostname).
 
         The board names itself from its own eth0 MAC using hostname_template
-        (e.g. 'Carebloom{MAC}'). We do NOT try to guess which host is 'new' -
+        (e.g. 'carebloom{MAC}'). We do NOT try to guess which host is 'new' -
         that breaks when re-flashing a board that's been on the LAN before.
         Instead we find the static prefix of the template (the part before
         the first {...} token, e.g. 'Carebloom') and look for any host whose
@@ -1793,4 +1793,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
