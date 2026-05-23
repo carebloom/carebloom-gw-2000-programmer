@@ -270,7 +270,7 @@ cat > "$CONFIG_FILE" <<EOF
   "bootfiles_dir": "$INSTALL_DIR/mass-storage-gadget64",
   "image_path": "$IMAGES_DIR/$IMAGE_BASENAME",
   "username": "pi",
-  "hostname": "carebloom{MAC}",
+  "hostname": "CareBloom{MAC}",
   "wifi_country": "US"
 }
 EOF

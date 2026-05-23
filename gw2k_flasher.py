@@ -13,6 +13,7 @@ All sudo calls are pre-authorized via /etc/sudoers.d/010-gw2k-flasher so
 operators never see a password prompt during normal use.
 """
 
+from email.mime import text
 import os
 import re
 import csv
@@ -50,9 +51,9 @@ DEFAULT_BOOTFILES_SUBDIR = "mass-storage-gadget64"
 DEFAULT_IMAGES_DIR = str(Path.home() / "gw2k-images")
 DEFAULT_USERNAME = "pi"
 DEFAULT_PASSWORD = "raspberry"
-DEFAULT_HOSTNAME = "carebloom{MAC}"   # {MAC} replaced with eth0 MAC at first boot
+DEFAULT_HOSTNAME = "CareBloom{MAC}"   # {MAC} replaced with eth0 MAC at first boot
 
-# Carebloom application installation
+# Care Bloom application installation
 DEFAULT_APP_NAME = "CARE001"          # top-level folder name inside the app zip
 DEFAULT_APPS_DIR = str(Path.home() / "gw2k-apps")  # where app zips live on host
 
@@ -428,10 +429,10 @@ class App(tk.Tk):
         self._row(f2, 4, "Wi-Fi password:", self.wifi_psk, show="•")
         self._row(f2, 5, "Wi-Fi country:", self.wifi_country)
 
-        f4 = ttk.LabelFrame(wrap, text="Carebloom application")
+        f4 = ttk.LabelFrame(wrap, text="Care Bloom application")
         f4.pack(fill="x", pady=(0, 8))
         self._row(f4, 0, "App archive:", self.app_zip_path,
-                  browse=("file", "Select Carebloom app archive (.tar.gz / .zip)"))
+                  browse=("file", "Select Care Bloom app archive (.tar.gz / .zip)"))
         self._row(f4, 1, "App folder name:", self.app_name,
                   hint="  (top-level folder inside the archive, e.g. CARE001)")
 
@@ -550,7 +551,7 @@ class App(tk.Tk):
         wrap.pack(fill="both", expand=True)
 
         ttk.Label(wrap, justify="left", text=(
-            "Installs the Carebloom application onto a CM4 that has already\n"
+            "Installs the Care Bloom application onto a CM4 that has already\n"
             "been flashed and verified. This automates:\n"
             "  - SCP the app archive to /tmp on the CM4\n"
             "  - Extract it (.tar.gz or .zip)\n"
@@ -580,7 +581,7 @@ class App(tk.Tk):
             ("Extract the app",           "Unpack into the home directory."),
             ("Install dos2unix",          "apt install dos2unix."),
             ("Fix line endings + perms",  "dos2unix + chmod +x on bin/ and etc/."),
-            ("Run setupSystemLocal.sh",   "The Carebloom system setup script."),
+            ("Run setupSystemLocal.sh",   "The Care Bloom system setup script."),
         ]
         self.install_steps = []
         for label, sub in step_defs:
@@ -942,7 +943,7 @@ class App(tk.Tk):
         #   {MACUPPER}— full MAC, uppercase, no colons
         # Default template if user left it blank or set 'auto':
         if not host_template or host_template.endswith("auto"):
-            host_template = "carebloom{MAC}"
+            host_template = "CareBloom{MAC}"
         # If the operator typed plain text, leave it alone (no MAC injection).
 
         firstrun = [
@@ -1267,10 +1268,10 @@ class App(tk.Tk):
         """Find the freshly-flashed board on the LAN. Returns (ip, hostname).
 
         The board names itself from its own eth0 MAC using hostname_template
-        (e.g. 'carebloom{MAC}'). We do NOT try to guess which host is 'new' -
+        (e.g. 'CareBloom{MAC}'). We do NOT try to guess which host is 'new' -
         that breaks when re-flashing a board that's been on the LAN before.
         Instead we find the static prefix of the template (the part before
-        the first {...} token, e.g. 'Carebloom') and look for any host whose
+        the first {...} token, e.g. 'CareBloom') and look for any host whose
         mDNS hostname starts with that prefix.
 
         Strategy, in order:
@@ -1412,7 +1413,7 @@ class App(tk.Tk):
             return
 
         self._reset_install_steps()
-        self._start_transcript(INSTALL_LOG, "Carebloom App Installation")
+        self._start_transcript(INSTALL_LOG, "Care Bloom App Installation")
         self.install_results.delete("1.0", "end")
         self.install_btn.configure(state="disabled")
         self.install_status.configure(text="Installing...", foreground="#0a7")
@@ -1743,7 +1744,7 @@ class App(tk.Tk):
                 for e in self._install_saw_errors[:20]:
                     self._iresult("  " + e)
                 self._iresult("")
-                self._iresult("The Carebloom app did NOT install cleanly. "
+                self._iresult("The Care Bloom app did NOT install cleanly. "
                               "This is a problem inside setupSystemLocal.sh "
                               "(it does not stop on errors), not the flasher.")
                 self._set_install_step(5, "fail")
@@ -1753,12 +1754,12 @@ class App(tk.Tk):
             self._iresult("\n=== Application installed successfully ===")
 
             # setupSystemLocal.sh ends with "Please reboot the system..." -
-            # the Carebloom services only come up after a reboot. Trigger it
+            # the Care Bloom services only come up after a reboot. Trigger it
             # now. The reboot drops the SSH connection, so we issue it in the
             # background on the target and don't wait for an exit status
             # (there won't be one - the link dies first).
             self._iresult("")
-            self._iresult("Rebooting the GW2000 to start the Carebloom "
+            self._iresult("Rebooting the GW2000 to start the Care Bloom application"
                           "services...")
             try:
                 # 'sleep 2' lets our exec call return cleanly before the box
@@ -1778,7 +1779,7 @@ class App(tk.Tk):
                 # Not fatal - the install itself succeeded.
                 self._iresult(f"(Could not send reboot command: {e})")
                 self._iresult("Please reboot the GW2000 manually to start "
-                              "the Carebloom services.")
+                              "the Care Bloom services.")
             return True
         finally:
             try:
