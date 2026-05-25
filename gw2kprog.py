@@ -66,6 +66,12 @@ DEFAULT_HOSTNAME = "CareBloom{MAC}"   # {MAC} replaced with eth0 MAC at first bo
 DEFAULT_AP_SSID = "CareBloom{MAC}"    # {MAC} = eth0 MAC, substituted at first boot
 DEFAULT_AP_PASSWORD = "CareBloomDemo2021"
 
+# Minimum time (seconds) that must elapse between programming finishing and
+# Verify starting discovery. First boot runs firstrun.sh and then reboots, so
+# the board isn't discoverable until ~90-120 s after power-on. If the operator
+# clicks Find and Verify sooner, Verify waits out the remainder automatically.
+POST_PROGRAM_SETTLE_SECS = 120
+
 # Carebloom application installation
 DEFAULT_APP_NAME = "CARE001"          # top-level folder name inside the app zip
 DEFAULT_APPS_DIR = str(Path.home() / "gw2k-apps")  # where app zips live on host
@@ -582,6 +588,12 @@ class App(tk.Tk):
 
         self.found_ip = tk.StringVar(value="")
         self.found_host = tk.StringVar(value="")
+
+        # Wall-clock time (time.time()) when programming last finished
+        # successfully. Verify uses this to enforce a minimum settle delay so
+        # the board has time to finish first boot (firstrun.sh + its reboot)
+        # before discovery starts. None = no program run this session.
+        self.program_finished_at = None
 
         # App installation
         self.app_zip_path = tk.StringVar(value="")
@@ -1416,6 +1428,9 @@ class App(tk.Tk):
             def finish():
                 self.start_btn.configure(state="normal")
                 if ok:
+                    # Snapshot when programming finished. Verify uses this to
+                    # hold off discovery until the board has had time to boot.
+                    self.program_finished_at = time.time()
                     self.program_status.configure(
                         text="✓ Program complete. Remove BOOT jumper, "
                              "connect Ethernet, power-cycle, then go to Verify.",
@@ -1818,6 +1833,11 @@ class App(tk.Tk):
             self.verify_results.see("end")
         self.after(0, upd)
 
+    def _set_verify_status(self, text, color="#000"):
+        """Thread-safe update of the Verify tab's status line."""
+        self.after(0, lambda: self.verify_status.configure(
+            text=text, foreground=color))
+
     def _verify_workflow(self):
         ok = False
         try:
@@ -1847,6 +1867,39 @@ class App(tk.Tk):
             self._result("ERROR: paramiko not installed. "
                           "Run: sudo apt install python3-paramiko")
             return False
+
+        # Enforce a settle delay after programming. First boot runs
+        # firstrun.sh and then reboots, so the board isn't discoverable for
+        # ~90-120 s. If the operator clicked Find and Verify sooner, wait out
+        # the remainder here. If 2 min already elapsed, this is a no-op.
+        if self.program_finished_at is not None:
+            elapsed = time.time() - self.program_finished_at
+            remaining = POST_PROGRAM_SETTLE_SECS - elapsed
+            if remaining > 0:
+                self._result(
+                    f"Programming finished {int(elapsed)} s ago. The board "
+                    "is still completing first boot (firstrun.sh runs, then "
+                    "the board reboots once).")
+                self._result(
+                    f"Waiting {int(remaining)} s before discovery so the "
+                    "board has time to come up...")
+                while True:
+                    remaining = (POST_PROGRAM_SETTLE_SECS
+                                 - (time.time() - self.program_finished_at))
+                    if remaining <= 0:
+                        break
+                    mins, secs = divmod(int(remaining), 60)
+                    self._set_verify_status(
+                        f"Board still booting — discovery starts in "
+                        f"{mins}:{secs:02d}", "#a60")
+                    time.sleep(1)
+                self._result("Settle delay complete — starting discovery.\n")
+                self._set_verify_status("Searching for the board…", "#000")
+            else:
+                self._result(
+                    f"Programming finished {int(elapsed)} s ago "
+                    "(past the 2-min settle window) — starting discovery "
+                    "immediately.\n")
 
         self._result(f"Hostname template: {template}")
         self._result("Final hostname depends on the CM4's Ethernet MAC,")
