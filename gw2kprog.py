@@ -68,8 +68,13 @@ DEFAULT_APPS_DIR = str(Path.home() / "gw2k-apps")  # where app zips live on host
 # gw2kprog.py script itself, so it travels with the install / repo.
 DEFAULT_FIRMWARE_DIR = str(Path(__file__).resolve().parent / "gateway-firmware")
 
+# Raspberry Pi MAC OUI prefixes, used to narrow LAN discovery. Raspberry Pi
+# registers new blocks periodically, so this list will go stale over time -
+# discovery also falls back to matching the CareBloom* hostname (see below),
+# which catches boards whose OUI isn't listed here yet.
 PI_MAC_PREFIXES = ("b8:27:eb", "dc:a6:32", "e4:5f:01",
-                   "2c:cf:67", "d8:3a:dd", "28:cd:c1")
+                   "2c:cf:67", "d8:3a:dd", "28:cd:c1",
+                   "88:a2:9e")
 
 LOG_FILE = str(Path.home() / "gw2k_program_log.csv")
 CONFIG_FILE = str(Path.home() / ".gw2kprog.json")
@@ -1962,6 +1967,7 @@ class App(tk.Tk):
                     arp = ""
 
                 pi_hosts = []
+                other_hosts = []
                 for line in arp.splitlines():
                     m = re.match(
                         r"^(\d+\.\d+\.\d+\.\d+)\s.*\s([0-9a-f:]{17})",
@@ -1971,9 +1977,24 @@ class App(tk.Tk):
                     ip, mac = m.group(1), m.group(2).lower()
                     if any(mac.startswith(o) for o in PI_MAC_PREFIXES):
                         pi_hosts.append((ip, mac))
+                    else:
+                        other_hosts.append((ip, mac))
+
+                # Fallback: Raspberry Pi keeps registering new MAC OUI blocks,
+                # so a board can have a MAC that PI_MAC_PREFIXES doesn't list
+                # yet. Don't let an unlisted OUI hide a board - also check any
+                # non-Pi-OUI host whose hostname matches the CareBloom prefix.
+                for ip, mac in other_hosts:
+                    actual = resolve_ip_to_name(ip)
+                    if actual and actual.lower().startswith(prefix_l):
+                        self._result(
+                            f"Found {ip} by hostname ({actual}); its MAC "
+                            f"OUI {mac[:8]} is not in PI_MAC_PREFIXES - "
+                            "consider adding it.")
+                        pi_hosts.append((ip, mac))
 
                 if pi_hosts:
-                    self._result(f"Pi-MAC hosts found: {len(pi_hosts)} - "
+                    self._result(f"Candidate hosts found: {len(pi_hosts)} - "
                                   "resolving hostnames...")
 
                 for ip, mac in pi_hosts:
