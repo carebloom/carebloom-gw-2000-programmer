@@ -747,12 +747,16 @@ class App(tk.Tk):
         ttk.Button(f3, text="Load defaults",
                    command=self._load_defaults).pack(side="left", padx=4)
 
+        ttk.Label(wrap, justify="left", foreground="#000",
+                  font=("DejaVu Sans", 13, "bold"),
+                  text="Follow these steps before opening the "
+                       "'2. Program' tab.").pack(anchor="w", pady=(12, 2))
         ttk.Label(wrap, justify="left", foreground="#000", text=(
-            "1. Set the BOOT switch on gateway to the ON position.\n"
-            "2. Plug the USB-A to USB-C cable into the gateway USB-C "
-            "receptacle.\n"
-            "3. Plug the LAN ethernet cable into the gateway."
-        )).pack(anchor="w", pady=(12, 0))
+            "1. Set the BOOT switch on the gateway to the ON position.\n"
+            "2. Connect one of the blue USB 3.0 ports on the programmer "
+            "to the gateway USB-C port.\n"
+            "3. Plug the LAN cable in to the ethernet port on the gateway."
+        )).pack(anchor="w", pady=(0, 0))
 
     def _build_program_tab(self, parent):
         wrap = ttk.Frame(parent, padding=12)
@@ -816,19 +820,25 @@ class App(tk.Tk):
         wrap.pack(fill="both", expand=True)
 
         ttk.Label(wrap, justify="left", text=(
-            "After programming finished:\n"
+            "After programming has finished and before clicking "
+            "'Find and Verify':\n"
             "\n"
             "  1. Unplug the USB-C cable from the gateway.\n"
             "  2. Move the BOOT switch on the gateway to the OFF position.\n"
             "  3. Connect the 5V/3A USB-C power supply to the gateway "
             "USB-C receptacle.\n"
-            "  4. Click the 'Find and Verify' button below.\n"
-            "\n"
+            "  4. Click the 'Find and Verify' button below."
+        )).pack(anchor="w", pady=(0, 4))
+
+        # NOTE on one logical line that re-wraps as the window scales.
+        note = ttk.Label(wrap, justify="left", text=(
             "NOTE: Because the first boot after programming the EMMC "
             "includes filesystem expansion and a reboot, ~ 2 minutes is "
             "required before the gateway will be ready. A built in delay "
-            "timer handles this automatically."
-        )).pack(anchor="w", pady=(0, 8))
+            "timer handles this automatically."))
+        note.pack(anchor="w", fill="x", pady=(0, 8))
+        note.bind("<Configure>",
+                  lambda e: note.configure(wraplength=e.width - 4))
 
         ctrl = ttk.Frame(wrap)
         ctrl.pack(fill="x", pady=4)
@@ -860,10 +870,18 @@ class App(tk.Tk):
         wrap = ttk.Frame(parent, padding=12)
         wrap.pack(fill="both", expand=True)
 
-        ttk.Label(wrap, justify="left", text=(
+        # Intro sentence on one logical line that re-wraps as the window
+        # scales. Tk Labels only wrap when wraplength is set, so bind it to
+        # the frame width on resize.
+        intro = ttk.Label(wrap, justify="left", text=(
             "Installs the Care Bloom application onto the gateway that has "
-            "already been programmed\n"
-            "and verified. The following steps are automated:\n"
+            "already been programmed and verified. The following steps are "
+            "automated:"))
+        intro.pack(anchor="w", fill="x")
+        intro.bind("<Configure>",
+                   lambda e: intro.configure(wraplength=e.width - 4))
+
+        ttk.Label(wrap, justify="left", text=(
             "\n"
             "  1. The application is loaded into the /tmp folder on the "
             "gateway.\n"
