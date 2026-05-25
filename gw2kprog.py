@@ -262,7 +262,9 @@ def local_subnets():
             continue
         try:
             net = ipaddress.ip_network(cidr, strict=False)
-            if 22 <= net.prefixlen <= 30:
+            # Accept any plausible LAN prefix. The ping-sweep caps host count
+            # itself; mDNS discovery doesn't care about subnet size at all.
+            if 8 <= net.prefixlen <= 30:
                 nets.append(str(net))
         except Exception:
             pass
@@ -1933,7 +1935,60 @@ class App(tk.Tk):
             except Exception:
                 return ""
 
+        def mdns_find_by_prefix():
+            """Enumerate mDNS hosts via avahi-browse and return (ip, name) for
+            the first whose hostname starts with the CareBloom prefix.
+
+            This needs no subnet scan, so it works regardless of the host's
+            netmask (a /16 LAN, etc.) - unlike the ping-sweep fallback below.
+            It is also the most reliable path: the board advertises itself
+            over mDNS as soon as avahi is up."""
+            if not which("avahi-browse"):
+                return None, None
+            try:
+                # -t terminate, -r resolve, -p parseable, -k no name lookups.
+                out = subprocess.check_output(
+                    ["avahi-browse", "-atrpk"],
+                    text=True, stderr=subprocess.DEVNULL, timeout=20)
+            except Exception:
+                return None, None
+            for line in out.splitlines():
+                # Resolved records start with '=' ; fields are ';'-separated:
+                # =;iface;proto;name;type;domain;host;ip;port;txt
+                if not line.startswith("="):
+                    continue
+                f = line.split(";")
+                if len(f) < 8:
+                    continue
+                host = f[6].split(".")[0]
+                ip = f[7]
+                if host.lower().startswith(prefix_l) and ":" not in ip:
+                    return ip, host
+            return None, None
+
+        # --- Step 1: direct mDNS discovery (fast, netmask-independent) ------
+        self._result("Browsing mDNS for a CareBloom host...")
+        ip, host = mdns_find_by_prefix()
+        if ip:
+            self._result(f"Found via mDNS: {host} at {ip}")
+            return ip, host
+        self._result("mDNS browse found nothing yet; falling back to "
+                      "LAN ping-sweep.")
+
+        # --- Step 2: ping-sweep + ARP fallback -----------------------------
+        scanned_any = False
         while time.time() < deadline:
+            subs = local_subnets()
+            if not subs:
+                self._result("WARNING: no scannable subnet found (the host's "
+                              "network may be wider than /22). Retrying mDNS "
+                              "instead.")
+                ip, host = mdns_find_by_prefix()
+                if ip:
+                    self._result(f"Found via mDNS: {host} at {ip}")
+                    return ip, host
+                time.sleep(5)
+                continue
             for net in local_subnets():
                 try:
                     network = ipaddress.ip_network(net)
@@ -1941,7 +1996,10 @@ class App(tk.Tk):
                     continue
                 hosts = list(network.hosts())
                 if len(hosts) > 512:
+                    self._result(f"Skipping ping-sweep of {net}: too large "
+                                  f"({len(hosts)} hosts). Relying on mDNS.")
                     continue
+                scanned_any = True
                 self._result(f"Scanning {net} ({len(hosts)} hosts)...")
                 threads = []
                 for ip in hosts:
@@ -2438,3 +2496,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    
