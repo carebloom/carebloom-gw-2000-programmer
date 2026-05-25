@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Care Bloom GW2000 Flasher — production flashing & verification tool for the
-on the Waveshare CM4-IO-Base-C. Runs on a Raspberry Pi host (Trixie/Bookworm
-with Desktop), launched by operators via a desktop icon.
+Care Bloom GW2000 Programmer — production programming & verification tool
+for the CM4 on the Waveshare CM4-IO-Base-C. Runs on a Raspberry Pi host
+(Trixie/Bookworm with Desktop), launched by operators via a desktop icon.
 
-Three tabs:
-  1. Configure — set image / username / password / hostname / Wi-Fi
-  2. Flash     — single button, runs the full flash workflow with green ticks
-  3. Verify    — finds the freshly-flashed board on the LAN and SSHes in
+Five tabs:
+  1. Configure        — set image / username / password / hostname / Wi-Fi
+  2. Program          — single button, runs the full programming workflow
+  3. Verify           — finds the programmed board on the LAN and SSHes in
+  4. App Installation — installs the Carebloom application onto the board
+  5. Label Generation — prints GW-2000 QR-code labels on the Zebra ZD410
 
-All sudo calls are pre-authorized via /etc/sudoers.d/010-gw2k-flasher so
+All sudo calls are pre-authorized via /etc/sudoers.d/010-gw2kprog so
 operators never see a password prompt during normal use.
 """
 
@@ -29,12 +31,17 @@ from datetime import datetime
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 
 try:
     import paramiko
 except ImportError:
     paramiko = None
+
+try:
+    import qrcode
+except ImportError:
+    qrcode = None
 
 
 # =============================================================================
@@ -56,18 +63,45 @@ DEFAULT_HOSTNAME = "CareBloom{MAC}"   # {MAC} replaced with eth0 MAC at first bo
 DEFAULT_APP_NAME = "CARE001"          # top-level folder name inside the app zip
 DEFAULT_APPS_DIR = str(Path.home() / "gw2k-apps")  # where app zips live on host
 
+# The programmer looks here by default for the gateway application firmware
+# tarball (a .tar.gz). This is a "gateway-firmware" subfolder next to the
+# gw2kprog.py script itself, so it travels with the install / repo.
+DEFAULT_FIRMWARE_DIR = str(Path(__file__).resolve().parent / "gateway-firmware")
+
 PI_MAC_PREFIXES = ("b8:27:eb", "dc:a6:32", "e4:5f:01",
                    "2c:cf:67", "d8:3a:dd", "28:cd:c1")
 
-LOG_FILE = str(Path.home() / "gw2k_flash_log.csv")
-CONFIG_FILE = str(Path.home() / ".gw2k_flasher.json")
+LOG_FILE = str(Path.home() / "gw2k_program_log.csv")
+CONFIG_FILE = str(Path.home() / ".gw2kprog.json")
 
 # Full transcripts of each operation, for sharing when something goes wrong.
 # Each run overwrites the file so it always reflects the most recent attempt.
-TRANSCRIPT_DIR = str(Path.home() / "gw2k-flasher-logs")
-FLASH_LOG = os.path.join(TRANSCRIPT_DIR, "flash_transcript.log")
+TRANSCRIPT_DIR = str(Path.home() / "gw2k-programmer-logs")
+PROGRAM_LOG = os.path.join(TRANSCRIPT_DIR, "program_transcript.log")
 VERIFY_LOG = os.path.join(TRANSCRIPT_DIR, "verify_transcript.log")
 INSTALL_LOG = os.path.join(TRANSCRIPT_DIR, "install_transcript.log")
+
+# -----------------------------------------------------------------------------
+# Label generation (Zebra ZD410 thermal printer, ZPL over raw USB)
+#
+# This matches the label format produced by the CareBloom Anchor Programmer
+# (an2kprog.py) so GW-2000 gateway labels are visually identical to AN-2000
+# anchor labels. The only differences:
+#   - Part number is GW-2000 (not AN-2000)
+#   - The QR code encodes the CM4's eth0 MAC address
+# -----------------------------------------------------------------------------
+PRINTER_DEVICE  = "/dev/usb/lp0"   # raw USB device node on Linux/RPi
+PRINTER_DPI     = 300              # ZD410 300 dpi model
+LABEL_WIDTH_IN  = 1.0              # physical label width in inches
+LABEL_HEIGHT_IN = 0.5              # physical label height in inches
+
+LABEL_PRODUCT_PN = "GW-2000"       # part number printed on every GW2000 label
+LABELS_PER_PRINT = 2               # copies of each label per print job (one for
+                                   # the board, one for paperwork / backup)
+
+# On-screen preview size (2:1 aspect ratio, matching a 1" x 0.5" sticker).
+LABEL_PREVIEW_W = 320
+LABEL_PREVIEW_H = 160
 
 
 # =============================================================================
@@ -296,13 +330,222 @@ def find_bootfs_mount(disk_path, deadline):
 
 
 # =============================================================================
+# Label generation — ZPL builder + Zebra ZD410 printer
+#
+# Ported from the CareBloom Anchor Programmer (an2kprog.py) so GW-2000 labels
+# are byte-for-byte the same format as AN-2000 anchor labels, except for the
+# part number (GW-2000) and the MAC encoded in the QR code.
+# =============================================================================
+
+class LabelPrinterError(Exception):
+    """Raised when label printing fails."""
+
+
+def normalize_mac(mac):
+    """Return a MAC as 12 uppercase hex characters with no separators.
+
+    Accepts the common forms: 'd8:3a:dd:c4:55:70', 'd8-3a-dd-c4-55-70',
+    'd83add c45570', 'd83addc45570'. Raises ValueError if the result is not
+    exactly 12 hex digits."""
+    cleaned = re.sub(r"[^0-9A-Fa-f]", "", mac or "")
+    if len(cleaned) != 12:
+        raise ValueError(
+            f"MAC must be 12 hex digits; got {len(cleaned)} "
+            f"from '{mac}'.")
+    return cleaned.upper()
+
+
+def format_mac_colons(mac):
+    """Return a normalized MAC formatted with colons (AA:BB:CC:DD:EE:FF)."""
+    m = normalize_mac(mac)
+    return ":".join(m[i:i + 2] for i in range(0, 12, 2))
+
+
+def build_label_zpl(mac, pn=LABEL_PRODUCT_PN, lot="",
+                     copies=LABELS_PER_PRINT):
+    """Build a ZPL byte string for a 1" x 0.5" label: QR code on the left,
+    three lines of text on the right:
+
+        +-----------------------------+
+        |  QR     PN:GW-2000          |
+        |  QR     LOT:202605          |
+        |  QR     D83ADDC45570        |
+        +-----------------------------+
+
+    The QR encodes the bare 12-char MAC (no colons). PN and LOT are text only.
+    This mirrors an2kprog.py's build_label_zpl() exactly so the two product
+    families produce visually identical labels.
+    """
+    mac_clean = normalize_mac(mac)
+    pn_clean  = (pn  or "").strip()
+    lot_clean = (lot or "").strip()
+
+    line_pn  = f"PN:{pn_clean}"
+    line_lot = f"LOT:{lot_clean}"
+    line_mac = mac_clean   # no prefix — the QR makes it obvious this is the MAC
+
+    # Label dimensions in dots (300 dpi): 300 x 150.
+    label_w = int(LABEL_WIDTH_IN  * PRINTER_DPI)
+    label_h = int(LABEL_HEIGHT_IN * PRINTER_DPI)
+
+    # ---- Manual offset tuning ----
+    # Positive X shifts RIGHT; positive Y shifts DOWN. 1 dot = 1/300".
+    # These values are carried over from an2kprog.py's tuned layout.
+    qr_offset_x   = 20
+    qr_offset_y   = 7
+    text_offset_x = 25
+    text_offset_y = 15
+
+    # ZPL Font A renders characters at roughly 70% of the specified width.
+    font_w_render_ratio = 0.70
+
+    # Print darkness 0-30 (direct-thermal labels want ~15-25).
+    darkness = 20
+
+    # ---- QR geometry ----
+    # 12-char alphanumeric data with H error correction -> Version 2 = 25
+    # modules per side. At magnification N the QR is 25*N dots wide.
+    qr_mag = 4
+    qr_size_est = 25 * qr_mag
+    qr_x = 6
+    qr_y = max(0, (label_h - qr_size_est) // 2)
+
+    # ---- Text geometry ----
+    text_area_left  = qr_x + qr_size_est + 6
+    text_area_right = label_w - 4
+    text_area_w     = text_area_right - text_area_left
+
+    longest_len = max(len(line_pn), len(line_lot), len(line_mac))
+    n_lines = 3
+
+    font_w = max(7, int(text_area_w / (longest_len * font_w_render_ratio)))
+
+    label_h_usable = label_h - 8
+    font_h_max = int(label_h_usable / (n_lines + (n_lines - 1) / 6))
+    font_h = max(10, min(font_h_max, int(font_w * 2.0)))
+    font_h = max(font_h, font_w)
+
+    line_gap = max(2, font_h // 6)
+    text_block_h = font_h * n_lines + line_gap * (n_lines - 1)
+
+    text_x = text_area_left
+    text_block_top = max(0, (label_h - text_block_h) // 2)
+    text_y_pn  = text_block_top
+    text_y_lot = text_y_pn  + font_h + line_gap
+    text_y_mac = text_y_lot + font_h + line_gap
+
+    # "HA," = high (~30%) error correction, automatic data mode.
+    zpl = (
+        "^XA"
+        "^MMT"
+        "^MNY"
+        f"^PW{label_w}"
+        f"^LL{label_h}"
+        "^LS0"
+        "^LH0,0"
+        "^PON"
+        f"^MD{darkness}"
+        # --- QR code (encodes MAC only) ---
+        f"^FO{qr_x + qr_offset_x},{qr_y + qr_offset_y}"
+        f"^BQN,2,{qr_mag}"
+        f"^FDHA,{mac_clean}^FS"
+        # --- Line 1: PN ---
+        f"^FO{text_x + text_offset_x},{text_y_pn + text_offset_y}"
+        f"^A0N,{font_h},{font_w}"
+        f"^FD{line_pn}^FS"
+        # --- Line 2: LOT ---
+        f"^FO{text_x + text_offset_x},{text_y_lot + text_offset_y}"
+        f"^A0N,{font_h},{font_w}"
+        f"^FD{line_lot}^FS"
+        # --- Line 3: MAC ---
+        f"^FO{text_x + text_offset_x},{text_y_mac + text_offset_y}"
+        f"^A0N,{font_h},{font_w}"
+        f"^FD{line_mac}^FS"
+        f"^PQ{int(copies)},0,0,N"
+        "^XZ"
+    )
+    return zpl.encode("utf-8")
+
+
+def print_label(mac, pn=LABEL_PRODUCT_PN, lot="",
+                copies=LABELS_PER_PRINT, device=PRINTER_DEVICE):
+    """Send a label print job to the ZD410. Raises LabelPrinterError on
+    failure. The printer must be powered on, loaded with stock, and present
+    at `device` (typically /dev/usb/lp0 on a Pi)."""
+    zpl = build_label_zpl(mac, pn=pn, lot=lot, copies=copies)
+    try:
+        with open(device, "wb") as f:
+            f.write(zpl)
+    except FileNotFoundError:
+        raise LabelPrinterError(
+            f"Printer device '{device}' not found. Is the ZD410 plugged in "
+            "and powered on?")
+    except PermissionError:
+        raise LabelPrinterError(
+            f"Permission denied accessing '{device}'. Add your user to the "
+            "'lp' group: sudo usermod -a -G lp $USER (then log out / in).")
+    except OSError as e:
+        raise LabelPrinterError(f"Failed to write to printer: {e}")
+
+
+def calibrate_printer(device=PRINTER_DEVICE):
+    """Run the ZD410's automatic media calibration. Needed when a new roll of
+    labels is loaded or when prints come out misaligned."""
+    label_w = int(LABEL_WIDTH_IN  * PRINTER_DPI)
+    label_h = int(LABEL_HEIGHT_IN * PRINTER_DPI)
+    zpl = (
+        "^XA"
+        "^MMT"
+        "^MNY"
+        f"^PW{label_w}"
+        f"^LL{label_h}"
+        "^LH0,0"
+        "^LS0"
+        "^PON"
+        "^MD0"
+        "^PR4,4"
+        "^JUS"
+        "^XZ"
+        "~JC"
+    ).encode("utf-8")
+    try:
+        with open(device, "wb") as f:
+            f.write(zpl)
+    except FileNotFoundError:
+        raise LabelPrinterError(
+            f"Printer device '{device}' not found. Is the ZD410 plugged in?")
+    except PermissionError:
+        raise LabelPrinterError(
+            f"Permission denied accessing '{device}'.")
+    except OSError as e:
+        raise LabelPrinterError(f"Failed to write to printer: {e}")
+
+
+def qr_matrix(data):
+    """Return the QR code module matrix (list of list of bool) for `data`,
+    using the same parameters as the printed label (H error correction).
+    Requires the `qrcode` package; returns None if it isn't installed."""
+    if qrcode is None:
+        return None
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_H,
+        box_size=1,
+        border=2,
+    )
+    qr.add_data(data)
+    qr.make(fit=True)
+    return qr.get_matrix()
+
+
+# =============================================================================
 # Main application
 # =============================================================================
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Care Bloom Gateway Flasher")
+        self.title("Care Bloom Gateway Programmer")
         try:
             self.tk.call("tk", "scaling", 1.3)
         except Exception:
@@ -331,6 +574,11 @@ class App(tk.Tk):
         self.app_name = tk.StringVar(value=DEFAULT_APP_NAME)
         self.install_host = tk.StringVar(value="")
 
+        # Label generation
+        self.label_mac = tk.StringVar(value="")
+        self.label_lot = tk.StringVar(value="")
+        self.label_copies = tk.StringVar(value=str(LABELS_PER_PRINT))
+
         self.steps = []
         self.expected_hostname = None
         self.expected_user = None
@@ -344,6 +592,11 @@ class App(tk.Tk):
         if not self.image_path.get():
             self._auto_pick_image()
 
+        # Likewise, if no app archive is set, pick the newest firmware tarball
+        # from the gateway-firmware folder next to the script.
+        if not self.app_zip_path.get():
+            self._auto_pick_firmware()
+
     def _auto_pick_image(self):
         d = DEFAULT_IMAGES_DIR
         if not os.path.isdir(d):
@@ -356,11 +609,26 @@ class App(tk.Tk):
         self.image_path.set(imgs[0])
         self.log(f"Auto-picked image: {imgs[0]}")
 
+    def _auto_pick_firmware(self):
+        """Pick the newest application firmware tarball from the
+        gateway-firmware folder, so the App archive field is pre-filled on a
+        fresh start."""
+        d = DEFAULT_FIRMWARE_DIR
+        if not os.path.isdir(d):
+            return
+        tarballs = [os.path.join(d, f) for f in os.listdir(d)
+                    if f.lower().endswith((".tar.gz", ".tgz", ".tar", ".zip"))]
+        if not tarballs:
+            return
+        tarballs.sort(key=os.path.getmtime, reverse=True)
+        self.app_zip_path.set(tarballs[0])
+        self.log(f"Auto-picked firmware: {tarballs[0]}")
+
     # ---- UI ----------------------------------------------------------------
     def _build_ui(self):
         top = ttk.Frame(self, padding=8)
         top.pack(side="top", fill="x")
-        ttk.Label(top, text="Care Bloom GW2000 Flasher",
+        ttk.Label(top, text="Care Bloom GW2000 Programmer",
                   font=("DejaVu Sans", 18, "bold")).pack(side="left")
         ttk.Label(top, text="  WAVESHARE CM4-IO-BASE-C",
                   foreground="#666").pack(side="left", padx=10, pady=8)
@@ -368,19 +636,22 @@ class App(tk.Tk):
         nb = ttk.Notebook(self)
         nb.pack(side="top", fill="both", expand=True, padx=8, pady=8)
         self.cfg_tab = ttk.Frame(nb)
-        self.flash_tab = ttk.Frame(nb)
+        self.program_tab = ttk.Frame(nb)
         self.verify_tab = ttk.Frame(nb)
         self.install_tab = ttk.Frame(nb)
+        self.label_tab = ttk.Frame(nb)
         nb.add(self.cfg_tab, text="1. Configure")
-        nb.add(self.flash_tab, text="2. Flash")
+        nb.add(self.program_tab, text="2. Program")
         nb.add(self.verify_tab, text="3. Verify")
         nb.add(self.install_tab, text="4. App Installation")
+        nb.add(self.label_tab, text="5. Label Generation")
         self.notebook = nb
 
         self._build_cfg_tab(self.cfg_tab)
-        self._build_flash_tab(self.flash_tab)
+        self._build_program_tab(self.program_tab)
         self._build_verify_tab(self.verify_tab)
         self._build_install_tab(self.install_tab)
+        self._build_label_tab(self.label_tab)
 
     def _row(self, parent, r, label, var, browse=None, show=None, hint=""):
         ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", padx=6, pady=4)
@@ -393,9 +664,19 @@ class App(tk.Tk):
             kind, title = browse
             def pick():
                 if kind == "file":
+                    tl = title.lower()
+                    if "image" in tl:
+                        start = DEFAULT_IMAGES_DIR
+                    elif "archive" in tl:
+                        # App archive browser opens at the gateway-firmware
+                        # folder if it exists, else the home directory.
+                        start = (DEFAULT_FIRMWARE_DIR
+                                 if os.path.isdir(DEFAULT_FIRMWARE_DIR)
+                                 else os.path.expanduser("~"))
+                    else:
+                        start = os.path.expanduser("~")
                     p = filedialog.askopenfilename(
-                        title=title,
-                        initialdir=DEFAULT_IMAGES_DIR if "image" in title.lower() else os.path.expanduser("~"))
+                        title=title, initialdir=start)
                 else:
                     p = filedialog.askdirectory(title=title)
                 if p:
@@ -443,12 +724,12 @@ class App(tk.Tk):
                    command=self._load_defaults).pack(side="left", padx=4)
 
         ttk.Label(wrap, justify="left", foreground="#666", text=(
-            "\nWhen ready, switch to the 'Flash' tab.\n"
+            "\nWhen ready, switch to the 'Program' tab.\n"
             "Connect a fresh CM4: 12 V off, BOOT jumper FITTED, USB-C to this Pi.\n"
             "Then click Start — apply 12 V power immediately after."
         )).pack(anchor="w", pady=(12, 0))
 
-    def _build_flash_tab(self, parent):
+    def _build_program_tab(self, parent):
         wrap = ttk.Frame(parent, padding=12)
         wrap.pack(fill="both", expand=True)
 
@@ -462,7 +743,7 @@ class App(tk.Tk):
              "Confirm a small (~8/16/32 GB) USB disk appears."),
             ("Unmount any partitions",
              "Detach any auto-mounted partitions."),
-            ("Flash image",
+            ("Program image",
              "Stream the image straight to the block device."),
             ("Re-attach for config",
              "rpiboot to expose bootfs partition."),
@@ -485,24 +766,24 @@ class App(tk.Tk):
 
         ctrl = ttk.Frame(wrap)
         ctrl.pack(fill="x", pady=12)
-        self.start_btn = ttk.Button(ctrl, text="Start Flash",
-                                    command=self._start_flash_thread)
+        self.start_btn = ttk.Button(ctrl, text="Program GW2000",
+                                    command=self._start_program_thread)
         self.start_btn.pack(side="left", padx=4, ipadx=20, ipady=6)
         ttk.Button(ctrl, text="Reset", command=self._reset_steps).pack(side="left", padx=4)
 
         statusf = ttk.LabelFrame(wrap, text="Status")
         statusf.pack(fill="both", expand=True, pady=(8, 0))
-        self.flash_status = ttk.Label(statusf, text="Ready.",
+        self.program_status = ttk.Label(statusf, text="Ready.",
                                        font=("DejaVu Sans", 13))
-        self.flash_status.pack(anchor="w", padx=6, pady=6)
+        self.program_status.pack(anchor="w", padx=6, pady=6)
 
-        self.flash_results = scrolledtext.ScrolledText(
+        self.program_results = scrolledtext.ScrolledText(
             statusf, height=14, wrap="word", font=("DejaVu Sans Mono", 10))
-        self.flash_results.pack(fill="both", expand=True, padx=6, pady=(0, 6))
-        self.flash_results.configure(state="disabled")
+        self.program_results.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.program_results.configure(state="disabled")
 
         ttk.Label(statusf,
-                  text=f"Full transcript saved to: {FLASH_LOG}",
+                  text=f"Full transcript saved to: {PROGRAM_LOG}",
                   foreground="#888").pack(anchor="w", padx=6, pady=(0, 6))
 
     def _build_verify_tab(self, parent):
@@ -510,7 +791,7 @@ class App(tk.Tk):
         wrap.pack(fill="both", expand=True)
 
         ttk.Label(wrap, justify="left", text=(
-            "After flashing finishes:\n"
+            "After programming finishes:\n"
             "  1. Disconnect 12 V power from the CM4 board.\n"
             "  2. REMOVE the BOOT jumper.\n"
             "  3. Connect Ethernet to your LAN (or rely on configured Wi-Fi).\n"
@@ -551,7 +832,7 @@ class App(tk.Tk):
 
         ttk.Label(wrap, justify="left", text=(
             "Installs the Carebloom application onto a CM4 that has already\n"
-            "been flashed and verified. This automates:\n"
+            "been programmed and verified. This automates:\n"
             "  - SCP the app archive to /tmp on the CM4\n"
             "  - Extract it (.tar.gz or .zip)\n"
             "  - apt install dos2unix\n"
@@ -618,6 +899,349 @@ class App(tk.Tk):
                   text=f"Full transcript saved to: {INSTALL_LOG}",
                   foreground="#888").pack(anchor="w", padx=6, pady=(0, 6))
 
+    # ---- Label generation tab ---------------------------------------------
+    def _build_label_tab(self, parent):
+        wrap = ttk.Frame(parent, padding=12)
+        wrap.pack(fill="both", expand=True)
+
+        ttk.Label(wrap, justify="left", text=(
+            "Prints QR-code labels for the GW-2000 gateway on the Zebra "
+            "ZD410 thermal printer.\n"
+            "Labels match the AN-2000 anchor format: a QR code on the left "
+            "and three text lines\n"
+            "on the right. The QR code encodes the CM4's eth0 MAC address."
+        )).pack(anchor="w", pady=(0, 8))
+
+        # MAC entry row
+        macf = ttk.Frame(wrap)
+        macf.pack(fill="x", pady=4)
+        ttk.Label(macf, text="CM4 Ethernet MAC:").pack(side="left")
+        ttk.Entry(macf, textvariable=self.label_mac, width=24).pack(
+            side="left", padx=6)
+        ttk.Button(macf, text="Use verified board's MAC",
+                   command=self._label_use_verified_mac).pack(
+            side="left", padx=4)
+        ttk.Button(macf, text="Read MAC over SSH…",
+                   command=self._label_read_mac_ssh).pack(side="left", padx=4)
+        ttk.Label(macf, text="(any format: aa:bb:cc:dd:ee:ff or aabbccddeeff)",
+                  foreground="#888").pack(side="left", padx=6)
+
+        # LOT + copies row
+        lotf = ttk.Frame(wrap)
+        lotf.pack(fill="x", pady=4)
+        ttk.Label(lotf, text="LOT:").pack(side="left")
+        ttk.Entry(lotf, textvariable=self.label_lot, width=16).pack(
+            side="left", padx=6)
+        ttk.Label(lotf, text="   Copies:").pack(side="left")
+        ttk.Spinbox(lotf, from_=1, to=20, width=4,
+                    textvariable=self.label_copies).pack(side="left", padx=6)
+        ttk.Label(lotf, text=f"   Part number: {LABEL_PRODUCT_PN}",
+                  foreground="#555",
+                  font=("DejaVu Sans", 11, "bold")).pack(side="left", padx=12)
+
+        # Live preview
+        prevf = ttk.LabelFrame(wrap, text="Label preview (1.0\" x 0.5\")")
+        prevf.pack(fill="x", pady=8)
+        inner = ttk.Frame(prevf, padding=10)
+        inner.pack()
+        self.label_canvas = tk.Canvas(
+            inner, width=LABEL_PREVIEW_W, height=LABEL_PREVIEW_H,
+            background="white", highlightthickness=1,
+            highlightbackground="#000")
+        self.label_canvas.pack()
+        ttk.Label(prevf,
+                  text="Preview updates as you type. The QR encodes the "
+                       "bare MAC (no colons).",
+                  foreground="#888").pack(anchor="w", padx=8, pady=(0, 6))
+
+        # Controls
+        ctrl = ttk.Frame(wrap)
+        ctrl.pack(fill="x", pady=8)
+        self.print_btn = ttk.Button(
+            ctrl, text="Print Labels", command=self._start_print_thread)
+        self.print_btn.pack(side="left", padx=4, ipadx=20, ipady=6)
+        ttk.Button(ctrl, text="Calibrate Printer",
+                   command=self._start_calibrate_thread).pack(
+            side="left", padx=4)
+        ttk.Label(ctrl,
+                  text=f"   Printer: {PRINTER_DEVICE}",
+                  foreground="#888").pack(side="left", padx=6)
+
+        # Status
+        statusf = ttk.LabelFrame(wrap, text="Status")
+        statusf.pack(fill="both", expand=True, pady=(8, 0))
+        self.label_status = ttk.Label(statusf, text="Ready.",
+                                       font=("DejaVu Sans", 13))
+        self.label_status.pack(anchor="w", padx=6, pady=6)
+        self.label_results = scrolledtext.ScrolledText(
+            statusf, height=8, wrap="word", font=("DejaVu Sans Mono", 10))
+        self.label_results.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # Redraw the preview whenever any field changes.
+        for var in (self.label_mac, self.label_lot):
+            var.trace_add("write", lambda *_: self._refresh_label_preview())
+
+        if qrcode is None:
+            self._lresult("WARNING: the 'qrcode' package is not installed, so "
+                          "the on-screen preview cannot draw the QR code.")
+            self._lresult("Printing still works (the ZD410 generates the QR "
+                          "itself from the ZPL ^BQ command).")
+            self._lresult("To enable the preview: sudo apt install "
+                          "python3-qrcode")
+
+        self._refresh_label_preview()
+
+    def _lresult(self, text):
+        """Append a line to the Label tab's status pane."""
+        def append():
+            self.label_results.insert("end", text + "\n")
+            self.label_results.see("end")
+        self.after(0, append)
+
+    def _label_use_verified_mac(self):
+        """Populate the MAC field from the board found on the Verify tab."""
+        mac = getattr(self, "found_mac", "") or ""
+        if not mac:
+            messagebox.showinfo(
+                "No verified board",
+                "No board MAC is known yet. Run the Verify tab first, or "
+                "type / read the MAC manually.")
+            return
+        self.label_mac.set(mac)
+        self._lresult(f"MAC set from verified board: {mac}")
+
+    def _label_read_mac_ssh(self):
+        """Read eth0's MAC live from a board over SSH."""
+        if paramiko is None:
+            messagebox.showerror(
+                "paramiko missing",
+                "paramiko is not installed. Run:\n"
+                "  sudo apt install python3-paramiko")
+            return
+        # Default the host to whatever Verify / App Installation last used.
+        default_host = (self.found_host.get().strip()
+                        or self.found_ip.get().strip()
+                        or self.install_host.get().strip())
+        host = simpledialog.askstring(
+            "Read MAC over SSH",
+            "Hostname or IP of the GW2000 to read eth0's MAC from:",
+            initialvalue=default_host, parent=self)
+        if not host:
+            return
+        self._lresult(f"Connecting to {host} to read eth0 MAC…")
+        self.print_btn.configure(state="disabled")
+
+        def worker():
+            user = self.expected_user or self.username.get()
+            pw = self.expected_pw or self.password.get()
+            mac = None
+            err = None
+            client = None
+            try:
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                client.connect(hostname=host, username=user, password=pw,
+                               timeout=12, allow_agent=False,
+                               look_for_keys=False)
+                stdin, stdout, stderr = client.exec_command(
+                    "cat /sys/class/net/eth0/address", timeout=10)
+                out = stdout.read().decode(errors="replace").strip()
+                if out:
+                    mac = out
+                else:
+                    err = "eth0 has no address (interface down?)."
+            except Exception as e:
+                err = str(e)
+            finally:
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+
+            def finish():
+                self.print_btn.configure(state="normal")
+                if mac:
+                    try:
+                        self.label_mac.set(format_mac_colons(mac))
+                        self._lresult(f"Read eth0 MAC: {mac}")
+                    except ValueError as e:
+                        self._lresult(f"Got an unexpected value: {e}")
+                else:
+                    self._lresult(f"Could not read MAC: {err}")
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _refresh_label_preview(self):
+        """Redraw the on-screen label preview from the current field values.
+        This mirrors what build_label_zpl() sends to the printer: QR on the
+        left, three text lines on the right."""
+        c = self.label_canvas
+        c.delete("all")
+        W, H = LABEL_PREVIEW_W, LABEL_PREVIEW_H
+
+        raw_mac = self.label_mac.get()
+        try:
+            mac_clean = normalize_mac(raw_mac)
+        except ValueError:
+            mac_clean = None
+
+        margin = 8
+        qr_box = H - 2 * margin   # square QR area on the left
+
+        if mac_clean is None:
+            # Placeholder QR area + guidance text.
+            c.create_rectangle(margin, margin, margin + qr_box,
+                               margin + qr_box, outline="#bbb", dash=(3, 3))
+            c.create_text(margin + qr_box / 2, margin + qr_box / 2,
+                          text="QR", fill="#bbb",
+                          font=("DejaVu Sans", 14, "bold"))
+            c.create_text(margin + qr_box + 12, H / 2, anchor="w",
+                          text="Enter a 12-digit MAC\nto preview the label.",
+                          fill="#999", font=("DejaVu Sans", 10))
+            self.label_status.configure(
+                text="Enter the CM4 Ethernet MAC to enable printing.",
+                foreground="#555")
+            self.print_btn.configure(state="disabled")
+            return
+
+        # ---- Draw the QR code preview ----
+        matrix = qr_matrix(mac_clean)
+        if matrix:
+            n = len(matrix)
+            module = qr_box / n
+            for row in range(n):
+                for col in range(n):
+                    if matrix[row][col]:
+                        x0 = margin + col * module
+                        y0 = margin + row * module
+                        c.create_rectangle(
+                            x0, y0, x0 + module, y0 + module,
+                            fill="black", outline="black")
+        else:
+            # qrcode not installed — show a stand-in box.
+            c.create_rectangle(margin, margin, margin + qr_box,
+                               margin + qr_box, outline="#888")
+            c.create_text(margin + qr_box / 2, margin + qr_box / 2,
+                          text="QR\n(preview\nunavailable)", fill="#888",
+                          justify="center", font=("DejaVu Sans", 9))
+
+        # ---- Draw the three text lines on the right ----
+        text_x = margin + qr_box + 12
+        lines = [
+            f"PN:{LABEL_PRODUCT_PN}",
+            f"LOT:{self.label_lot.get().strip()}",
+            mac_clean,
+        ]
+        n_lines = len(lines)
+        line_h = (H - 2 * margin) / n_lines
+        font = ("DejaVu Sans Mono", 11, "bold")
+        for i, ln in enumerate(lines):
+            cy = margin + line_h * (i + 0.5)
+            c.create_text(text_x, cy, anchor="w", text=ln,
+                          fill="black", font=font)
+
+        self.label_status.configure(
+            text=f"Ready to print {self.label_copies.get()} label(s) "
+                 f"for {format_mac_colons(mac_clean)}.",
+            foreground="#080")
+        self.print_btn.configure(state="normal")
+
+    def _label_copies_value(self):
+        """Parse the copies spinbox; default to LABELS_PER_PRINT on bad input."""
+        try:
+            n = int(str(self.label_copies.get()).strip())
+            return max(1, min(20, n))
+        except (ValueError, TypeError):
+            return LABELS_PER_PRINT
+
+    def _start_print_thread(self):
+        raw_mac = self.label_mac.get()
+        try:
+            mac_clean = normalize_mac(raw_mac)
+        except ValueError as e:
+            messagebox.showerror("Invalid MAC", str(e))
+            return
+
+        copies = self._label_copies_value()
+        lot = self.label_lot.get().strip()
+
+        if not messagebox.askyesno(
+                "Confirm print",
+                f"Print {copies} label(s)?\n\n"
+                f"  Part number: {LABEL_PRODUCT_PN}\n"
+                f"  LOT:         {lot or '(blank)'}\n"
+                f"  MAC:         {format_mac_colons(mac_clean)}\n\n"
+                f"Printer: {PRINTER_DEVICE}"):
+            return
+
+        self.print_btn.configure(state="disabled")
+        self.label_status.configure(text="Printing…", foreground="#0a7")
+        self._lresult(f"Sending {copies} label(s) to the printer "
+                      f"(PN={LABEL_PRODUCT_PN}, LOT={lot or '<blank>'}, "
+                      f"MAC={mac_clean})…")
+
+        def worker():
+            ok = True
+            try:
+                print_label(mac_clean, pn=LABEL_PRODUCT_PN, lot=lot,
+                            copies=copies)
+                self._lresult("Label(s) sent to printer.")
+            except LabelPrinterError as e:
+                ok = False
+                self._lresult(f"PRINT ERROR: {e}")
+            except Exception as e:
+                ok = False
+                self._lresult(f"PRINT ERROR (unexpected): {e}")
+
+            def finish():
+                self.print_btn.configure(state="normal")
+                if ok:
+                    self.label_status.configure(
+                        text="✓ Label(s) sent to printer.",
+                        foreground="#080")
+                else:
+                    self.label_status.configure(
+                        text="✗ Print failed — see status above.",
+                        foreground="#c00")
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _start_calibrate_thread(self):
+        if not messagebox.askyesno(
+                "Calibrate printer",
+                "Run the ZD410's automatic media calibration?\n\n"
+                "The printer will feed several blank labels while it "
+                "senses the gap. Do this after loading a new roll."):
+            return
+        self.print_btn.configure(state="disabled")
+        self._lresult("Running printer media calibration…")
+
+        def worker():
+            ok = True
+            try:
+                calibrate_printer()
+                self._lresult("Calibration command sent. The printer will "
+                              "feed a few labels.")
+            except LabelPrinterError as e:
+                ok = False
+                self._lresult(f"CALIBRATION ERROR: {e}")
+            except Exception as e:
+                ok = False
+                self._lresult(f"CALIBRATION ERROR (unexpected): {e}")
+
+            def finish():
+                self.print_btn.configure(state="normal")
+                self.label_status.configure(
+                    text=("✓ Calibration sent." if ok
+                          else "✗ Calibration failed — see status above."),
+                    foreground=("#080" if ok else "#c00"))
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _install_use_verified(self):
         """Populate the target host from the most recent verified board."""
         ip = self.found_ip.get().strip()
@@ -656,7 +1280,7 @@ class App(tk.Tk):
 
     def _start_transcript(self, path, title):
         """Truncate a transcript file and write a header. Called at the start
-        of each flash / verify / install run."""
+        of each program / verify / install run."""
         try:
             os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
@@ -674,17 +1298,17 @@ class App(tk.Tk):
 
 
     def log(self, s):
-        self._write_transcript(FLASH_LOG, s)
+        self._write_transcript(PROGRAM_LOG, s)
         self._log_q.put(s)
 
     def _drain_log(self):
         try:
             while True:
                 s = self._log_q.get_nowait()
-                self.flash_results.configure(state="normal")
-                self.flash_results.insert("end", s + "\n")
-                self.flash_results.see("end")
-                self.flash_results.configure(state="disabled")
+                self.program_results.configure(state="normal")
+                self.program_results.insert("end", s + "\n")
+                self.program_results.see("end")
+                self.program_results.configure(state="disabled")
         except queue.Empty:
             pass
         self.after(80, self._drain_log)
@@ -700,7 +1324,7 @@ class App(tk.Tk):
     def _reset_steps(self):
         for i in range(len(self.steps)):
             self._set_step(i, "pending")
-        self.flash_status.configure(text="Ready.", foreground="#000")
+        self.program_status.configure(text="Ready.", foreground="#000")
 
     # ---- Config persistence -----------------------------------------------
     def _save_defaults(self):
@@ -739,8 +1363,8 @@ class App(tk.Tk):
         if not silent:
             self.log(f"Loaded defaults from {CONFIG_FILE}")
 
-    # ---- Flash workflow ---------------------------------------------------
-    def _start_flash_thread(self):
+    # ---- Program workflow ---------------------------------------------------
+    def _start_program_thread(self):
         problems = []
         if not (self.rpiboot_path.get() and os.path.isfile(self.rpiboot_path.get())):
             problems.append("rpiboot binary not found")
@@ -760,36 +1384,36 @@ class App(tk.Tk):
             return
 
         self._reset_steps()
-        self._start_transcript(FLASH_LOG, "GW2000 Flash")
-        self.flash_results.configure(state="normal")
-        self.flash_results.delete("1.0", "end")
-        self.flash_results.configure(state="disabled")
+        self._start_transcript(PROGRAM_LOG, "GW2000 Program")
+        self.program_results.configure(state="normal")
+        self.program_results.delete("1.0", "end")
+        self.program_results.configure(state="disabled")
         self.start_btn.configure(state="disabled")
-        self.flash_status.configure(text="Running…", foreground="#0a7")
-        threading.Thread(target=self._flash_workflow, daemon=True).start()
+        self.program_status.configure(text="Running…", foreground="#0a7")
+        threading.Thread(target=self._program_workflow, daemon=True).start()
 
-    def _flash_workflow(self):
+    def _program_workflow(self):
         ok = False
         try:
-            ok = self._do_flash()
+            ok = self._do_program()
         except Exception as e:
             self.log(f"EXCEPTION: {e}")
         finally:
             def finish():
                 self.start_btn.configure(state="normal")
                 if ok:
-                    self.flash_status.configure(
-                        text="✓ Flash complete. Remove BOOT jumper, "
+                    self.program_status.configure(
+                        text="✓ Program complete. Remove BOOT jumper, "
                              "connect Ethernet, power-cycle, then go to Verify.",
                         foreground="#080")
                     self.notebook.select(self.verify_tab)
                 else:
-                    self.flash_status.configure(
-                        text="✗ Flash failed — see log.",
+                    self.program_status.configure(
+                        text="✗ Program failed — see log.",
                         foreground="#c00")
             self.after(0, finish)
 
-    def _do_flash(self):
+    def _do_program(self):
         # 1) rpiboot
         self._set_step(0, "running")
         self.log("=== Step 1: rpiboot ===")
@@ -826,7 +1450,7 @@ class App(tk.Tk):
         unmount_all_partitions(node, self.log)
         self._set_step(2, "ok")
 
-        # 4) flash
+        # 4) program
         self._set_step(3, "running")
         img = self.image_path.get()
         low = img.lower()
@@ -843,7 +1467,7 @@ class App(tk.Tk):
         else:
             pipeline = (f"sudo dd if={shlex.quote(img)} of={shlex.quote(node)} "
                         f"bs=4M conv=fsync status=progress")
-        self.log(f"=== Step 4: flash {os.path.basename(img)} → {node} ===")
+        self.log(f"=== Step 4: program {os.path.basename(img)} → {node} ===")
         rc, _ = run_stream(pipeline, self.log, shell=True)
         if rc != 0:
             self.log("dd failed.")
@@ -935,7 +1559,7 @@ class App(tk.Tk):
             return False
 
         # Hostname is derived on the target itself at first boot, so it
-        # reflects the actual Ethernet MAC of the CM4 we're flashing.
+        # reflects the actual Ethernet MAC of the CM4 we're programming.
         # Template tokens supported in the hostname field:
         #   {MAC}     — eth0 MAC, lowercase, no colons (e.g. b827ebabc123)
         #   {MAC6}    — last 6 hex chars of eth0 MAC (e.g. abc123)
@@ -1264,11 +1888,11 @@ class App(tk.Tk):
         return h
 
     def _find_board_by_mac(self, hostname_template, deadline):
-        """Find the freshly-flashed board on the LAN. Returns (ip, hostname).
+        """Find the freshly-programmed board on the LAN. Returns (ip, hostname).
 
         The board names itself from its own eth0 MAC using hostname_template
         (e.g. 'CareBloom{MAC}'). We do NOT try to guess which host is 'new' -
-        that breaks when re-flashing a board that's been on the LAN before.
+        that breaks when re-programming a board that's been on the LAN before.
         Instead we find the static prefix of the template (the part before
         the first {...} token, e.g. 'Carebloom') and look for any host whose
         mDNS hostname starts with that prefix.
@@ -1745,7 +2369,7 @@ class App(tk.Tk):
                 self._iresult("")
                 self._iresult("The Carebloom app did NOT install cleanly. "
                               "This is a problem inside setupSystemLocal.sh "
-                              "(it does not stop on errors), not the flasher.")
+                              "(it does not stop on errors), not the programmer.")
                 self._set_install_step(5, "fail")
                 return False
             self._set_install_step(5, "ok")

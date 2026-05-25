@@ -1,16 +1,30 @@
 #!/usr/bin/env bash
-# setup_host.sh - One-time setup for a Raspberry Pi (Trixie, Desktop) acting
-# as the production host for CM4 flashing on the Waveshare CM4-IO-Base-C.
+# setup_host.sh - One-time setup for the programmer host station. The host may
+# be a Raspberry Pi 4, a Pi 5, or a CM4 on a Pi 4-form-factor adapter board
+# (e.g. the Waveshare CM4-to-Pi4 adapter), running Trixie or Bookworm Desktop.
+# It acts as the host for CM4 programming on the Waveshare CM4-IO-Base-C.
+# rpiboot, the programming workflow, and SSH are unchanged across all three;
+# a CM4-on-Pi4-adapter behaves like a Pi 4 because the adapter routes the
+# CM4's USB out to standard USB-A host ports. (Note: the CM4's USB is 2.0
+# only, so programming throughput is lower than on a USB 3 Pi 5 - functionally
+# fine, just slower.)
 #
 # Run once as the desktop user (NOT as root). It will prompt for sudo when needed.
+# This script and gw2kprog.py ship together in the carebloom-gw-2000-programmer
+# repo; run it from inside that repo:
 #
-#   curl -sSL <your-url>/setup_host.sh -o ~/setup_host.sh
-#   bash ~/setup_host.sh
+#   git clone <your-repo-url> ~/carebloom-gw-2000-programmer
+#   cd ~/carebloom-gw-2000-programmer
+#   bash setup_host.sh
 #
 # After this script finishes:
 #   - rpiboot is built and installed under /opt/usbboot
-#   - gw2k_flasher.py and a desktop launcher are dropped on the Desktop
-#   - The operator user is added to plugdev so flashing doesn't need sudo
+#   - A desktop launcher is created that runs gw2kprog.py from this repo
+#   - A 'gateway-firmware' folder is created next to the script for the
+#     Carebloom application firmware tarball
+#   - The operator user is added to plugdev so programming doesn't need sudo
+#   - The operator user is added to lp so the Label Generation tab can write
+#     to the Zebra ZD410 label printer at /dev/usb/lp0
 #   - udev rules let the user open /dev/sdX devices written by rpiboot
 #   - A Pi OS image is pre-downloaded to ~/gw2k-images/
 #
@@ -29,18 +43,17 @@ USBBOOT_REPO="https://github.com/raspberrypi/usbboot.git"
 INSTALL_DIR="/opt/usbboot"
 IMAGES_DIR="$HOME/gw2k-images"
 DESKTOP_DIR="$HOME/Desktop"
-APP_DIR="$HOME/gw2k-flasher"
-ICON_PATH="$APP_DIR/icon.png"
-LAUNCHER_PATH="$DESKTOP_DIR/gw2k-flasher.desktop"
-FLASHER_PATH="$APP_DIR/gw2k_flasher.py"
 
-# Path to the gw2k_flasher.py source. The setup script looks for it next to
-# itself first, falls back to ~/Downloads/gw2k_flasher.py, then errors out.
-SRC_CANDIDATES=(
-    "$(dirname "$(readlink -f "$0")")/gw2k_flasher.py"
-    "$HOME/Downloads/gw2k_flasher.py"
-    "$HOME/gw2k_flasher.py"
-)
+# The programmer runs in place from the repo it ships in. APP_DIR is the
+# directory THIS setup script lives in (normally ~/carebloom-gw-2000-programmer).
+# Nothing is copied: the desktop launcher points straight at gw2kprog.py here,
+# and the gateway-firmware folder lives alongside it. This keeps a single copy
+# of the script so `git pull` updates are picked up immediately.
+APP_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+ICON_PATH="$APP_DIR/icon.png"
+LAUNCHER_PATH="$DESKTOP_DIR/gw2kprog.desktop"
+PROGRAMMER_PATH="$APP_DIR/gw2kprog.py"
+FIRMWARE_DIR="$APP_DIR/gateway-firmware"
 
 # ---------- Helpers -----------------------------------------------------------
 
@@ -66,16 +79,14 @@ require_pi() {
 require_not_root
 require_pi
 
-# Locate gw2k_flasher.py
-FLASHER_SRC=""
-for c in "${SRC_CANDIDATES[@]}"; do
-    if [ -f "$c" ]; then FLASHER_SRC="$c"; break; fi
-done
-if [ -z "$FLASHER_SRC" ]; then
-    die "Could not find gw2k_flasher.py.
-Place it next to this setup script, or in ~/Downloads/, then re-run."
+# Verify gw2kprog.py is present in the repo alongside this setup script.
+if [ ! -f "$PROGRAMMER_PATH" ]; then
+    die "Could not find gw2kprog.py next to this setup script.
+Expected: $PROGRAMMER_PATH
+Run setup_host.sh from inside the carebloom-gw-2000-programmer repo."
 fi
-ok "Found flasher script: $FLASHER_SRC"
+chmod +x "$PROGRAMMER_PATH" 2>/dev/null || true
+ok "Programmer script: $PROGRAMMER_PATH"
 
 # ---------- 1. APT packages ---------------------------------------------------
 
@@ -86,6 +97,7 @@ sudo apt-get install -y \
     libusb-1.0-0-dev libusb-1.0-0 \
     xz-utils unzip gzip \
     python3 python3-tk python3-pip python3-paramiko python3-zeroconf \
+    python3-qrcode \
     openssl avahi-utils iputils-ping iputils-arping \
     udisks2 polkitd \
     yad zenity
@@ -120,7 +132,7 @@ ok "udev rule installed"
 # ---------- 4. Polkit rule so the user can write to /dev/sdX without sudo -----
 
 say "Installing polkit rule for udisks2..."
-sudo tee /etc/polkit-1/rules.d/50-gw2k-flasher.rules > /dev/null <<EOF
+sudo tee /etc/polkit-1/rules.d/50-gw2kprog.rules > /dev/null <<EOF
 // Let plugdev members operate on removable USB block devices without auth.
 polkit.addRule(function(action, subject) {
     if (subject.isInGroup("plugdev")) {
@@ -132,22 +144,26 @@ polkit.addRule(function(action, subject) {
 EOF
 ok "polkit rule installed"
 
-# ---------- 5. Add operator user to plugdev -----------------------------------
+# ---------- 5. Add operator user to plugdev + lp groups -----------------------
+# plugdev : lets rpiboot / udisks operate on USB devices without sudo.
+# lp      : lets the programmer's Label Generation tab write ZPL directly to the
+#           Zebra ZD410 thermal printer at /dev/usb/lp0.
 
-say "Adding $USER to plugdev group..."
+say "Adding $USER to plugdev and lp groups..."
 sudo usermod -aG plugdev "$USER"
-ok "User added to plugdev (takes effect on next login)"
+sudo usermod -aG lp "$USER"
+ok "User added to plugdev and lp (takes effect on next login)"
 
-# ---------- 6. Allow flashing without a sudo password ------------------------
-# We narrow this to ONLY the binaries the flasher actually invokes, and we
+# ---------- 6. Allow programming without a sudo password ------------------------
+# We narrow this to ONLY the binaries the programmer actually invokes, and we
 # detect their REAL paths on this machine (Debian's usrmerge means /bin/X is a
 # symlink to /usr/bin/X, and sudo matches the resolved path - so we resolve
 # every command here rather than hard-coding paths that might be wrong).
 
-say "Configuring sudoers for the specific commands the flasher uses..."
+say "Configuring sudoers for the specific commands the programmer uses..."
 
-# Every command the flasher calls via sudo. Keep this list in sync with
-# gw2k_flasher.py if you add new sudo calls.
+# Every command the programmer calls via sudo. Keep this list in sync with
+# gw2kprog.py if you add new sudo calls.
 SUDO_CMDS=(rpiboot dd eject sync umount mount blkid install touch chmod tee)
 
 RESOLVED_PATHS=()
@@ -158,7 +174,7 @@ for cmd in "${SUDO_CMDS[@]}"; do
         continue
     fi
     # Resolve via command -v, then canonicalise symlinks so the path matches
-    # exactly what sudo will see when the flasher runs the command.
+    # exactly what sudo will see when the programmer runs the command.
     p="$(command -v "$cmd" 2>/dev/null || true)"
     if [ -n "$p" ]; then
         real="$(readlink -f "$p")"
@@ -168,17 +184,17 @@ for cmd in "${SUDO_CMDS[@]}"; do
             RESOLVED_PATHS+=("$p")
         fi
     else
-        warn "Command '$cmd' not found on PATH; flasher may prompt for a password when it needs it."
+        warn "Command '$cmd' not found on PATH; programmer may prompt for a password when it needs it."
     fi
 done
 
 # Build a comma-separated, de-duplicated list
 SUDO_LIST="$(printf '%s\n' "${RESOLVED_PATHS[@]}" | sort -u | paste -sd, -)"
 
-SUDOERS_FILE="/etc/sudoers.d/010-gw2k-flasher"
+SUDOERS_FILE="/etc/sudoers.d/010-gw2kprog"
 TMP_SUDO="$(mktemp)"
 cat > "$TMP_SUDO" <<EOF
-# Allow $USER to flash GW2000 gateways without password prompts.
+# Allow $USER to program GW2000 gateways without password prompts.
 # Narrowed to specific binaries; auto-generated by setup_host.sh.
 $USER ALL=(root) NOPASSWD: $SUDO_LIST
 EOF
@@ -207,13 +223,15 @@ else
     ok "Image already present at $IMAGES_DIR/$IMAGE_BASENAME"
 fi
 
-# ---------- 8. Install the flasher script ------------------------------------
+# ---------- 8. Prepare the gateway-firmware folder ----------------------------
+# The programmer runs in place (see APP_DIR above) - nothing to copy. It
+# auto-picks the newest application firmware tarball from a "gateway-firmware"
+# folder next to the script, so create that folder now (empty). The operator
+# just drops the .tar.gz in and the App-archive field fills itself.
 
-say "Installing gw2k_flasher.py..."
-mkdir -p "$APP_DIR"
-cp "$FLASHER_SRC" "$FLASHER_PATH"
-chmod +x "$FLASHER_PATH"
-ok "Installed to $FLASHER_PATH"
+say "Preparing the gateway-firmware folder..."
+mkdir -p "$FIRMWARE_DIR"
+ok "Firmware folder ready: $FIRMWARE_DIR  (place the app .tar.gz here)"
 
 # ---------- 9. Create a launcher icon -----------------------------------------
 
@@ -238,9 +256,9 @@ cat > "$LAUNCHER_PATH" <<EOF
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=GW2000 Flasher
-Comment=Flash and verify Care Bloom GW2000 gateways
-Exec=python3 $FLASHER_PATH
+Name=GW2000 Programmer
+Comment=Program and verify Care Bloom GW2000 gateways
+Exec=python3 $PROGRAMMER_PATH
 Icon=$ICON_PATH
 Terminal=false
 Categories=Utility;
@@ -257,12 +275,12 @@ ok "Desktop launcher created: $LAUNCHER_PATH"
 # Also drop the same .desktop file into the user's applications dir so it
 # shows up in the application menu.
 mkdir -p "$HOME/.local/share/applications"
-cp "$LAUNCHER_PATH" "$HOME/.local/share/applications/gw2k-flasher.desktop"
+cp "$LAUNCHER_PATH" "$HOME/.local/share/applications/gw2kprog.desktop"
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 
-# ---------- 10. Write a small default config so the flasher auto-fills paths --
+# ---------- 10. Write a small default config so the programmer auto-fills paths --
 
-CONFIG_FILE="$HOME/.gw2k_flasher.json"
+CONFIG_FILE="$HOME/.gw2kprog.json"
 if [ ! -f "$CONFIG_FILE" ]; then
 cat > "$CONFIG_FILE" <<EOF
 {
@@ -285,19 +303,25 @@ cat <<EOF
   Setup complete.
 
   Next steps:
-    1. LOG OUT and back in (or reboot) so the plugdev group membership and
-       the sudoers / udev rules take effect for your session.
-    2. Double-click the "GW2000 Flasher" icon on the Desktop to run the tool.
+    1. LOG OUT and back in (or reboot) so the plugdev / lp group membership
+       and the sudoers / udev rules take effect for your session.
+    2. Double-click the "GW2000 Programmer" icon on the Desktop to run the tool.
+
+  Label printing:
+    The Label Generation tab prints to a Zebra ZD410 thermal printer at
+    /dev/usb/lp0. Connect and power on the printer before printing. The lp
+    group membership added above grants the needed raw-device access.
 
   Locations:
-    Flasher script  : $FLASHER_PATH
+    Programmer script: $PROGRAMMER_PATH
     Desktop icon    : $LAUNCHER_PATH
     OS images       : $IMAGES_DIR
+    App firmware    : $FIRMWARE_DIR  (drop the app .tar.gz here)
     rpiboot binary  : $INSTALL_DIR/rpiboot
     Operator config : $CONFIG_FILE
-    Flash log       : ~/gw2k_flash_log.csv  (appended on each flash)
+    Program log     : ~/gw2k_program_log.csv  (appended on each run)
 
   To run from a terminal:
-    python3 $FLASHER_PATH
+    python3 $PROGRAMMER_PATH
 ===============================================================================
 EOF
