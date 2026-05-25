@@ -656,8 +656,6 @@ class App(tk.Tk):
         top.pack(side="top", fill="x")
         ttk.Label(top, text="Care Bloom GW2000 Programmer",
                   font=("DejaVu Sans", 18, "bold")).pack(side="left")
-        ttk.Label(top, text="  WAVESHARE CM4-IO-BASE-C",
-                  foreground="#666").pack(side="left", padx=10, pady=8)
 
         nb = ttk.Notebook(self)
         nb.pack(side="top", fill="both", expand=True, padx=8, pady=8)
@@ -749,12 +747,11 @@ class App(tk.Tk):
         ttk.Button(f3, text="Load defaults",
                    command=self._load_defaults).pack(side="left", padx=4)
 
-        ttk.Label(wrap, justify="left", foreground="#666", text=(
-            "\nWhen ready, switch to the 'Program' tab.\n"
-            "Connect a fresh CM4: BOOT jumper FITTED, USB-A-to-USB-C cable "
-            "ready but NOT yet plugged into this Pi.\n"
-            "Click Program — then plug the USB-C cable into this Pi "
-            "(the cable both powers the board and carries rpiboot)."
+        ttk.Label(wrap, justify="left", foreground="#000", text=(
+            "1. Set the BOOT switch on gateway to the ON position.\n"
+            "2. Plug the USB-A to USB-C cable into the gateway USB-C "
+            "receptacle.\n"
+            "3. Plug the LAN ethernet cable into the gateway."
         )).pack(anchor="w", pady=(12, 0))
 
     def _build_program_tab(self, parent):
@@ -765,7 +762,7 @@ class App(tk.Tk):
         steps_frame.pack(fill="both", expand=False)
 
         step_defs = [
-            ("Detect CM4 via rpiboot",
+            ("Detect gateway via rpiboot",
              "Plug USB-C into this Pi (BOOT jumper ON; the cable powers the board)."),
             ("Identify eMMC",
              "Confirm a small (~8/16/32 GB) USB disk appears."),
@@ -819,13 +816,18 @@ class App(tk.Tk):
         wrap.pack(fill="both", expand=True)
 
         ttk.Label(wrap, justify="left", text=(
-            "After programming finishes:\n"
-            "  1. Unplug the USB-C cable from this Pi (powers off the board).\n"
-            "  2. REMOVE the BOOT jumper.\n"
-            "  3. Connect Ethernet to your LAN.\n"
-            "  4. Power the board from the 5V/3A USB-C supply.\n"
-            "  5. Click 'Find and Verify' below.\n"
-            "First boot includes filesystem expansion and a reboot — allow ~2 min."
+            "After programming finished:\n"
+            "\n"
+            "  1. Unplug the USB-C cable from the gateway.\n"
+            "  2. Move the BOOT switch on the gateway to the OFF position.\n"
+            "  3. Connect the 5V/3A USB-C power supply to the gateway "
+            "USB-C receptacle.\n"
+            "  4. Click the 'Find and Verify' button below.\n"
+            "\n"
+            "NOTE: Because the first boot after programming the EMMC "
+            "includes filesystem expansion and a reboot, ~ 2 minutes is "
+            "required before the gateway will be ready. A built in delay "
+            "timer handles this automatically."
         )).pack(anchor="w", pady=(0, 8))
 
         ctrl = ttk.Frame(wrap)
@@ -859,13 +861,18 @@ class App(tk.Tk):
         wrap.pack(fill="both", expand=True)
 
         ttk.Label(wrap, justify="left", text=(
-            "Installs the Carebloom application onto a CM4 that has already\n"
-            "been programmed and verified. This automates:\n"
-            "  - SCP the app archive to /tmp on the CM4\n"
-            "  - Extract it (.tar.gz or .zip)\n"
-            "  - apt install dos2unix\n"
-            "  - dos2unix + chmod +x on bin/ and etc/\n"
-            "  - Run <app>/bin/setupSystemLocal.sh"
+            "Installs the Care Bloom application onto the gateway that has "
+            "already been programmed\n"
+            "and verified. The following steps are automated:\n"
+            "\n"
+            "  1. The application is loaded into the /tmp folder on the "
+            "gateway.\n"
+            "  2. The application is extracted.\n"
+            "  3. The dos2unix utility is installed on the gateway.\n"
+            "  4. dos2unix and chmod +x are applied to the application bin "
+            "and etc folders\n"
+            "      prior to installation.\n"
+            "  5. The application installer: setupSystemLocal.sh is ran."
         )).pack(anchor="w", pady=(0, 8))
 
         # Target host row
@@ -884,8 +891,8 @@ class App(tk.Tk):
         steps_frame = ttk.LabelFrame(wrap, text="Steps")
         steps_frame.pack(fill="x", pady=8)
         step_defs = [
-            ("Connect to CM4 over SSH",   "Uses the configured user / password."),
-            ("Transfer app archive",      "SCP the archive to /tmp on the CM4."),
+            ("Connect to gateway over SSH",   "Uses the configured user / password."),
+            ("Transfer app archive",      "SCP the archive to /tmp on the gateway."),
             ("Extract the app",           "Unpack into the home directory."),
             ("Install dos2unix",          "apt install dos2unix."),
             ("Fix line endings + perms",  "dos2unix + chmod +x on bin/ and etc/."),
@@ -937,13 +944,13 @@ class App(tk.Tk):
             "ZD410 thermal printer.\n"
             "Labels match the AN-2000 anchor format: a QR code on the left "
             "and three text lines\n"
-            "on the right. The QR code encodes the CM4's eth0 MAC address."
+            "on the right. The QR code encodes the gateway's eth0 MAC address."
         )).pack(anchor="w", pady=(0, 8))
 
         # MAC entry row
         macf = ttk.Frame(wrap)
         macf.pack(fill="x", pady=4)
-        ttk.Label(macf, text="CM4 Ethernet MAC:").pack(side="left")
+        ttk.Label(macf, text="Gateway Ethernet MAC:").pack(side="left")
         ttk.Entry(macf, textvariable=self.label_mac, width=24).pack(
             side="left", padx=6)
         ttk.Button(macf, text="Use verified board's MAC",
@@ -1129,7 +1136,7 @@ class App(tk.Tk):
                           text="Enter a 12-digit MAC\nto preview the label.",
                           fill="#999", font=("DejaVu Sans", 10))
             self.label_status.configure(
-                text="Enter the CM4 Ethernet MAC to enable printing.",
+                text="Enter the gateway Ethernet MAC to enable printing.",
                 foreground="#555")
             self.print_btn.configure(state="disabled")
             return
@@ -1840,7 +1847,7 @@ class App(tk.Tk):
             os.unlink(tmpc)
 
             self.log(f"Wrote firstrun.sh; hostname template: {host_template}")
-            self.log("(Final hostname will be derived from the CM4's eth0 MAC at first boot.)")
+            self.log("(Final hostname will be derived from the gateway's eth0 MAC at first boot.)")
             self.expected_hostname_template = host_template
             self.expected_hostname = None  # not known until target boots
             self.expected_user = user
@@ -1936,7 +1943,7 @@ class App(tk.Tk):
                     "immediately.\n")
 
         self._result(f"Hostname template: {template}")
-        self._result("Final hostname depends on the CM4's Ethernet MAC,")
+        self._result("Final hostname depends on the gateway's Ethernet MAC,")
         self._result("so we search by Pi MAC OUI on the LAN…\n")
         ip, host = self._find_board_by_mac(template,
                                             deadline=time.time() + 300)
@@ -2554,7 +2561,7 @@ class App(tk.Tk):
                 "DEBIAN_FRONTEND=noninteractive apt-get install -y dos2unix",
                 label="apt install dos2unix", sudo=True)
             if rc != 0:
-                self._iresult("dos2unix install failed - is the CM4 online?")
+                self._iresult("dos2unix install failed - is the gateway online?")
                 self._set_install_step(3, "fail")
                 return False
             self._set_install_step(3, "ok")
@@ -2656,4 +2663,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
