@@ -1692,6 +1692,22 @@ class App(tk.Tk):
                 "",
             ]
         firstrun += [
+            "# Disable Bluetooth - the CareBloom gateway uses Wi-Fi only.",
+            "# Three layers: the disable-bt overlay stops the BT hardware from",
+            "# initialising at all (this is what removes the bluetoothd LE-audio",
+            "# / SAP 'Operation not permitted' boot-log noise); disabling the",
+            "# hciuart and bluetooth services stops anything running before the",
+            "# next reboot picks up the overlay.",
+            "for CFG in /boot/firmware/config.txt /boot/config.txt; do",
+            "    if [ -f \"$CFG\" ] && ! grep -q '^dtoverlay=disable-bt' \"$CFG\"; then",
+            "        printf '\\n# CareBloom: gateway is Wi-Fi only, disable Bluetooth\\n' >> \"$CFG\"",
+            "        echo 'dtoverlay=disable-bt' >> \"$CFG\"",
+            "    fi",
+            "done",
+            "systemctl disable hciuart 2>/dev/null || true",
+            "systemctl disable bluetooth.service 2>/dev/null || true",
+            "systemctl stop bluetooth.service 2>/dev/null || true",
+            "",
             "# Self-destruct",
             "rm -f /boot/firmware/firstrun.sh /boot/firstrun.sh",
             "sed -i 's| systemd.run.*||g' /boot/firmware/cmdline.txt 2>/dev/null || true",
@@ -2496,5 +2512,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
     
