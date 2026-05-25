@@ -59,6 +59,13 @@ DEFAULT_USERNAME = "pi"
 DEFAULT_PASSWORD = "raspberry"
 DEFAULT_HOSTNAME = "CareBloom{MAC}"   # {MAC} replaced with eth0 MAC at first boot
 
+# The gateway brings up its own Wi-Fi access point on wlan0 as the backhaul
+# network that CareBloom room anchors connect to. The SSID is derived on the
+# board from the eth0 MAC (same {MAC} substitution as the hostname), so the
+# AP name matches the hostname. The password below is the AP's WPA2 key.
+DEFAULT_AP_SSID = "CareBloom{MAC}"    # {MAC} = eth0 MAC, substituted at first boot
+DEFAULT_AP_PASSWORD = "CareBloomDemo2021"
+
 # Carebloom application installation
 DEFAULT_APP_NAME = "CARE001"          # top-level folder name inside the app zip
 DEFAULT_APPS_DIR = str(Path.home() / "gw2k-apps")  # where app zips live on host
@@ -569,8 +576,8 @@ class App(tk.Tk):
         self.username = tk.StringVar(value=DEFAULT_USERNAME)
         self.password = tk.StringVar(value=DEFAULT_PASSWORD)
         self.hostname = tk.StringVar(value=DEFAULT_HOSTNAME)
-        self.wifi_ssid = tk.StringVar(value="")
-        self.wifi_psk = tk.StringVar(value="")
+        self.wifi_ssid = tk.StringVar(value=DEFAULT_AP_SSID)
+        self.wifi_psk = tk.StringVar(value=DEFAULT_AP_PASSWORD)
         self.wifi_country = tk.StringVar(value="US")
 
         self.found_ip = tk.StringVar(value="")
@@ -711,9 +718,9 @@ class App(tk.Tk):
         self._row(f2, 1, "Password:", self.password, show="•")
         self._row(f2, 2, "Hostname:", self.hostname,
                   hint="  ({MAC} = full MAC, {MAC6} = last 6, {MACUPPER} = uppercase)")
-        self._row(f2, 3, "Wi-Fi SSID:", self.wifi_ssid,
-                  hint="  (blank = Ethernet only)")
-        self._row(f2, 4, "Wi-Fi password:", self.wifi_psk, show="•")
+        self._row(f2, 3, "AP SSID:", self.wifi_ssid,
+                  hint="  (Wi-Fi AP for room anchors; {MAC} = eth0 MAC)")
+        self._row(f2, 4, "AP password:", self.wifi_psk, show="•")
         self._row(f2, 5, "Wi-Fi country:", self.wifi_country)
 
         f4 = ttk.LabelFrame(wrap, text="Carebloom application")
@@ -801,7 +808,7 @@ class App(tk.Tk):
             "After programming finishes:\n"
             "  1. Disconnect 12 V power from the CM4 board.\n"
             "  2. REMOVE the BOOT jumper.\n"
-            "  3. Connect Ethernet to your LAN (or rely on configured Wi-Fi).\n"
+            "  3. Connect Ethernet to your LAN.\n"
             "  4. Reconnect 12 V power.\n"
             "  5. Click 'Find and Verify' below.\n"
             "First boot includes filesystem expansion and a reboot — allow ~90 s."
@@ -1683,12 +1690,40 @@ class App(tk.Tk):
         ]
         if ssid:
             firstrun += [
-                "# Wi-Fi (NetworkManager on Bookworm/Trixie)",
-                f'nmcli connection add type wifi con-name {shlex.quote(ssid)} ifname wlan0 ssid {shlex.quote(ssid)} \\',
-                "    802-11-wireless-security.key-mgmt wpa-psk \\",
-                f'    802-11-wireless-security.psk {shlex.quote(psk)} \\',
-                "    connection.autoconnect yes",
+                "# --- Wi-Fi access point (backhaul for CareBloom anchors) ----",
+                "# The gateway broadcasts its own AP on wlan0. Room anchors",
+                "# join this network to reach the gateway. The SSID is derived",
+                "# from the eth0 MAC (same {MAC} substitution as the hostname)",
+                "# so the AP name matches the hostname.",
+                "# Set the Wi-Fi regulatory country first - AP mode needs it",
+                "# or the radio may refuse to start the access point.",
                 f"raspi-config nonint do_wifi_country {country} 2>/dev/null || true",
+                f"iw reg set {country} 2>/dev/null || true",
+                "# Make sure the Wi-Fi radio is not soft-blocked.",
+                "rfkill unblock wifi 2>/dev/null || true",
+                "",
+                f"AP_SSID_TEMPLATE={shlex.quote(ssid)}",
+                'AP_SSID=$(echo "$AP_SSID_TEMPLATE" | sed -e "s/{MAC}/$MAC/g" -e "s/{MAC6}/$MAC6/g" -e "s/{MACUPPER}/$MACUPPER/g")',
+                'echo "Configuring Wi-Fi AP with SSID: $AP_SSID"',
+                "",
+                "# Remove any pre-existing wlan0 connections so the AP is the",
+                "# only profile NetworkManager will bring up on the radio.",
+                "for C in $(nmcli -t -f NAME,DEVICE connection show 2>/dev/null \\",
+                "           | awk -F: '$2==\"wlan0\"{print $1}'); do",
+                '    nmcli connection delete "$C" 2>/dev/null || true',
+                "done",
+                "",
+                "# Create the AP connection. mode=ap makes wlan0 a Wi-Fi AP;",
+                "# ipv4.method=shared brings up NetworkManager's built-in DHCP",
+                "# server so joining anchors get addresses automatically.",
+                'nmcli connection add type wifi con-name CareBloom-AP ifname wlan0 \\',
+                '    ssid "$AP_SSID" \\',
+                "    802-11-wireless.mode ap 802-11-wireless.band bg \\",
+                "    wifi-sec.key-mgmt wpa-psk \\",
+                f'    wifi-sec.psk {shlex.quote(psk)} \\',
+                "    ipv4.method shared ipv6.method ignore \\",
+                "    connection.autoconnect yes",
+                'nmcli connection up CareBloom-AP 2>/dev/null || true',
                 "",
             ]
         firstrun += [
