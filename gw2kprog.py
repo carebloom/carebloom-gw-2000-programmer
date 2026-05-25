@@ -1942,12 +1942,30 @@ class App(tk.Tk):
             ("Model",       "tr -d '\\000' </proc/device-tree/model; echo"),
             ("Hostname",    "hostnamectl --static"),
             ("Uptime",      "uptime"),
+            ("Clock",       "echo \"now: $(date)\"; echo \"booted: "
+                            "$(uptime -s)\"; timedatectl 2>/dev/null "
+                            "| grep -E 'System clock|NTP' || true"),
             ("Memory",      "free -h"),
             ("Disk",        "df -h /"),
             ("CPU temp",    "vcgencmd measure_temp 2>/dev/null || cat /sys/class/thermal/thermal_zone0/temp"),
             ("Throttled?",  "vcgencmd get_throttled 2>/dev/null || echo n/a"),
             ("Network",     "ip -br addr; echo; ip route"),
-            ("Boot errors", "journalctl -b -p err --no-pager 2>/dev/null | tail -n 5 || true"),
+            # Current boot only (-b 0). Show seconds-since-boot timestamps
+            # (-o short-monotonic) instead of wall-clock, because a Pi with no
+            # RTC reports a fake build-date time until NTP syncs - wall-clock
+            # timestamps on early boot entries are misleading. Benign,
+            # expected lines (PCIe link-down on an empty M.2 slot, Bluetooth
+            # LE-audio/SAP plugin gripes, wpa_supplicant interface-type
+            # probes) are filtered out so only actionable errors show.
+            ("Boot errors (this boot)",
+             "journalctl -b 0 -p err -o short-monotonic --no-pager 2>/dev/null "
+             "| grep -v -E "
+             "'fd500000.pcie: link down|bluetoothd.*(vcp|mcp|bap|sap)|"
+             "wpa_supplicant.*Registration to specific type' "
+             "| tail -n 8 || true"),
+            ("AP status",
+             "nmcli -t -f NAME,DEVICE,STATE connection show --active "
+             "2>/dev/null | grep -i wlan || echo '(no active wlan connection)'"),
         ]
         all_ok = True
         for label, cmd in checks:
@@ -1959,7 +1977,10 @@ class App(tk.Tk):
                 if out: self._result(out)
                 if err: self._result("[stderr] " + err)
                 rc = stdout.channel.recv_exit_status()
-                if rc != 0 and label != "Boot errors":
+                # These checks are informational - a non-zero exit (e.g. grep
+                # finding no matches) is not a verify failure.
+                if rc != 0 and label not in (
+                        "Boot errors (this boot)", "AP status"):
                     all_ok = False
             except Exception as e:
                 self._result(f"=== {label} ===\n[error] {e}")
