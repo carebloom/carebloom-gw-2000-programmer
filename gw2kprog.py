@@ -751,8 +751,10 @@ class App(tk.Tk):
 
         ttk.Label(wrap, justify="left", foreground="#666", text=(
             "\nWhen ready, switch to the 'Program' tab.\n"
-            "Connect a fresh CM4: 12 V off, BOOT jumper FITTED, USB-C to this Pi.\n"
-            "Then click Start — apply 12 V power immediately after."
+            "Connect a fresh CM4: BOOT jumper FITTED, USB-A-to-USB-C cable "
+            "ready but NOT yet plugged into this Pi.\n"
+            "Click Program — then plug the USB-C cable into this Pi "
+            "(the cable both powers the board and carries rpiboot)."
         )).pack(anchor="w", pady=(12, 0))
 
     def _build_program_tab(self, parent):
@@ -764,7 +766,7 @@ class App(tk.Tk):
 
         step_defs = [
             ("Detect CM4 via rpiboot",
-             "Plug board (BOOT jumper ON, USB-C, then 12 V)."),
+             "Plug USB-C into this Pi (BOOT jumper ON; the cable powers the board)."),
             ("Identify eMMC",
              "Confirm a small (~8/16/32 GB) USB disk appears."),
             ("Unmount any partitions",
@@ -818,12 +820,12 @@ class App(tk.Tk):
 
         ttk.Label(wrap, justify="left", text=(
             "After programming finishes:\n"
-            "  1. Disconnect 12 V power from the CM4 board.\n"
+            "  1. Unplug the USB-C cable from this Pi (powers off the board).\n"
             "  2. REMOVE the BOOT jumper.\n"
             "  3. Connect Ethernet to your LAN.\n"
-            "  4. Reconnect 12 V power.\n"
+            "  4. Power the board from the 5V/3A USB-C supply.\n"
             "  5. Click 'Find and Verify' below.\n"
-            "First boot includes filesystem expansion and a reboot — allow ~90 s."
+            "First boot includes filesystem expansion and a reboot — allow ~2 min."
         )).pack(anchor="w", pady=(0, 8))
 
         ctrl = ttk.Frame(wrap)
@@ -1450,8 +1452,9 @@ class App(tk.Tk):
             ["sudo", self.rpiboot_path.get(), "-d", self.bootfiles_dir.get()],
             self.log, timeout=180)
         if rc != 0:
-            self.log("rpiboot failed. Check: BOOT jumper fitted, "
-                     "USB-C to host, 12 V applied AFTER rpiboot started.")
+            self.log("rpiboot failed. Check: BOOT jumper fitted, and the "
+                     "USB-C cable plugged into this Pi AFTER rpiboot started "
+                     "(the cable powers the board).")
             self._set_step(0, "fail")
             return False
         self._set_step(0, "ok")
@@ -1940,7 +1943,8 @@ class App(tk.Tk):
         if not ip:
             self._result("Could not find the board within 5 minutes.")
             self._result("Check: BOOT jumper REMOVED, Ethernet connected, "
-                          "12 V applied. Wait ~90 s after power-on.")
+                          "5V/3A USB-C supply powering the board. "
+                          "Wait ~120 s after power-on.")
             return False
         self.found_ip.set(ip)
         self.found_host.set(host or "")
@@ -2653,4 +2657,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-    
