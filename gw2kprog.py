@@ -795,10 +795,12 @@ class App(tk.Tk):
 
         ctrl = ttk.Frame(wrap)
         ctrl.pack(fill="x", pady=12)
-        self.start_btn = ttk.Button(ctrl, text="Program GW2000",
+        self.start_btn = ttk.Button(ctrl, text="Program GW2000", width=15,
                                     command=self._start_program_thread)
         self.start_btn.pack(side="left", padx=4, ipadx=20, ipady=6)
-        ttk.Button(ctrl, text="Reset", command=self._reset_steps).pack(side="left", padx=4)
+        ttk.Button(ctrl, text="Reset", width=15,
+                   command=self._reset_steps).pack(
+            side="right", padx=4, ipadx=20, ipady=6)
 
         statusf = ttk.LabelFrame(wrap, text="Status")
         statusf.pack(fill="both", expand=True, pady=(8, 0))
@@ -1009,14 +1011,16 @@ class App(tk.Tk):
         ctrl = ttk.Frame(wrap)
         ctrl.pack(fill="x", pady=8)
         self.print_btn = ttk.Button(
-            ctrl, text="Print Labels", command=self._start_print_thread)
+            ctrl, text="Print Labels", width=17,
+            command=self._start_print_thread)
         self.print_btn.pack(side="left", padx=4, ipadx=20, ipady=6)
-        ttk.Button(ctrl, text="Calibrate Printer",
+        ttk.Button(ctrl, text="Calibrate Printer", width=17,
                    command=self._start_calibrate_thread).pack(
-            side="left", padx=4)
+            side="right", padx=4, ipadx=20, ipady=6)
         ttk.Label(ctrl,
-                  text=f"   Printer: {PRINTER_DEVICE}",
-                  foreground="#888").pack(side="left", padx=6)
+                  text=f"Printer: {PRINTER_DEVICE}",
+                  foreground="#888", anchor="center").pack(
+            side="left", fill="x", expand=True, padx=6)
 
         # Status
         statusf = ttk.LabelFrame(wrap, text="Status")
