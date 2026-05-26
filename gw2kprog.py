@@ -1220,15 +1220,6 @@ class App(tk.Tk):
         copies = self._label_copies_value()
         lot = self.label_lot.get().strip()
 
-        if not messagebox.askyesno(
-                "Confirm print",
-                f"Print {copies} label(s)?\n\n"
-                f"  Part number: {LABEL_PRODUCT_PN}\n"
-                f"  LOT:         {lot or '(blank)'}\n"
-                f"  MAC:         {format_mac_colons(mac_clean)}\n\n"
-                f"Printer: {PRINTER_DEVICE}"):
-            return
-
         self.print_btn.configure(state="disabled")
         self.label_status.configure(text="Printing…", foreground="#0a7")
         self._lresult(f"Sending {copies} label(s) to the printer "
@@ -1375,9 +1366,31 @@ class App(tk.Tk):
         self.steps[idx]["icon"].configure(text=glyph[0], foreground=glyph[1])
 
     def _reset_steps(self):
+        """Reset the Program tab AND clear all per-board state on the Verify
+        and App Installation tabs. The Reset button starts a fresh gateway,
+        so stale PASS/FAIL results from the previous board must not linger."""
         for i in range(len(self.steps)):
             self._set_step(i, "pending")
         self.program_status.configure(text="Ready.", foreground="#000")
+
+        # --- Clear Verify tab ---
+        try:
+            self.verify_results.delete("1.0", "end")
+        except Exception:
+            pass
+        self.verify_status.configure(text="", foreground="#000")
+        self.found_ip.set("")
+        self.found_host.set("")
+        self.found_mac = ""
+
+        # --- Clear App Installation tab ---
+        for i in range(len(self.install_steps)):
+            self._set_install_step(i, "pending")
+        try:
+            self.install_results.delete("1.0", "end")
+        except Exception:
+            pass
+        self.install_status.configure(text="Ready.", foreground="#000")
 
     # ---- Config persistence -----------------------------------------------
     def _save_defaults(self):
