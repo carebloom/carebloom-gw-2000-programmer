@@ -933,8 +933,6 @@ class App(tk.Tk):
         self.install_btn = ttk.Button(ctrl, text="Install Application",
                                       command=self._start_install_thread)
         self.install_btn.pack(side="left", padx=4, ipadx=20, ipady=6)
-        ttk.Button(ctrl, text="Reset",
-                   command=self._reset_install_steps).pack(side="left", padx=4)
 
         statusf = ttk.LabelFrame(wrap, text="Status")
         statusf.pack(fill="both", expand=True, pady=(8, 0))
@@ -1254,12 +1252,6 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _start_calibrate_thread(self):
-        if not messagebox.askyesno(
-                "Calibrate printer",
-                "Run the ZD410's automatic media calibration?\n\n"
-                "The printer will feed several blank labels while it "
-                "senses the gap. Do this after loading a new roll."):
-            return
         self.print_btn.configure(state="disabled")
         self._lresult("Running printer media calibration…")
 
