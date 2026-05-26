@@ -1919,6 +1919,15 @@ class App(tk.Tk):
                     self.verify_status.configure(
                         text="✓ PASS — board is up and healthy.",
                         foreground="#080")
+                    # Autofill the downstream tabs from the verified board so
+                    # the operator doesn't have to press "Use verified board".
+                    target = (self.found_host.get().strip()
+                              or self.found_ip.get().strip())
+                    if target:
+                        self.install_host.set(target)
+                    mac = getattr(self, "found_mac", "") or ""
+                    if mac:
+                        self.label_mac.set(mac)
                 else:
                     self.verify_status.configure(
                         text="✗ FAIL — see results above.",
