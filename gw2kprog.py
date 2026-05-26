@@ -2102,6 +2102,24 @@ class App(tk.Tk):
         prefix_l = prefix.lower()
         self._result(f"Looking for any host whose name starts with '{prefix}'")
 
+        def record_found(ip, host, mac=None):
+            """Record discovery results so other tabs (e.g. Label Generation)
+            can use them. found_mac is derived from the hostname when not
+            given directly - the board names itself CareBloom<eth0-MAC>, so
+            the trailing 12 hex digits of the hostname ARE the MAC. This runs
+            on every discovery path (mDNS and ping-sweep) so found_mac is set
+            no matter how the board was found."""
+            if not mac and host:
+                hex_only = re.sub(r"[^0-9A-Fa-f]", "", host)
+                if len(hex_only) >= 12:
+                    mac = hex_only[-12:]
+            if mac:
+                try:
+                    self.found_mac = format_mac_colons(mac)
+                except ValueError:
+                    self.found_mac = mac
+            return ip, host
+
         def resolve_ip_to_name(ip):
             """Reverse-resolve an IP to a hostname via avahi, then DNS."""
             if which("avahi-resolve"):
@@ -2156,7 +2174,7 @@ class App(tk.Tk):
         ip, host = mdns_find_by_prefix()
         if ip:
             self._result(f"Found via mDNS: {host} at {ip}")
-            return ip, host
+            return record_found(ip, host)
         self._result("mDNS browse found nothing yet; falling back to "
                       "LAN ping-sweep.")
 
@@ -2171,7 +2189,7 @@ class App(tk.Tk):
                 ip, host = mdns_find_by_prefix()
                 if ip:
                     self._result(f"Found via mDNS: {host} at {ip}")
-                    return ip, host
+                    return record_found(ip, host)
                 time.sleep(5)
                 continue
             for net in local_subnets():
@@ -2265,10 +2283,9 @@ class App(tk.Tk):
                             pass
 
                     if matched:
-                        self.found_mac = mac
                         self._result(
                             f"MATCH: {ip} ({mac}) -> hostname: {name}")
-                        return ip, name
+                        return record_found(ip, name, mac=mac)
                     else:
                         self._result(
                             f"  {ip} ({mac}) name='{actual or '?'}' "
