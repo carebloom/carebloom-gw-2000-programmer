@@ -2262,27 +2262,43 @@ class App(tk.Tk):
                 except Exception:
                     pass
 
-    def _match_by_program_id(self, boards, user, pw):
+    def _match_by_program_id(self, boards, user, pw, ruled_out=None):
         """Given discovered (ip, hostname) boards, SSH into each and look for
         the one whose /etc/gw2k_program_id matches this session's token.
 
+        ruled_out, if given, is a set of hostnames already known to carry a
+        DIFFERENT valid token - those boards cannot be the target, so they
+        are skipped without re-probing. Hostnames found to carry a different
+        token are added to ruled_out so later retries skip them too.
+
         Returns:
           (ip, host)            - the board carrying this run's token
-          None                  - token known, but no board has it yet
-                                   (caller should keep waiting / retry)
+          None                  - no board has it yet (caller retries; a
+                                   board still booting will not have a
+                                   readable token until firstrun.sh runs)
         Only called when self.program_id is set.
         """
         want = self.program_id
+        if ruled_out is None:
+            ruled_out = set()
         for ip, host in boards:
+            if host.lower() in ruled_out:
+                continue  # already known to be a different board
             tok = self._read_program_id(ip, user, pw)
             if tok is None:
-                self._result(f"  {host} ({ip}): no program-id readable yet.")
+                # No token readable - board may still be booting / SSH not up
+                # yet. Inconclusive: do NOT rule it out, retry next pass.
+                self._result(f"  {host} ({ip}): no program-id readable yet "
+                              "(still booting?).")
                 continue
             if tok == want:
                 self._result(f"  {host} ({ip}): program-id MATCH.")
                 return ip, host
+            # Valid token, but from a different run - this board can never be
+            # the target. Rule it out so we never SSH it again this verify.
+            ruled_out.add(host.lower())
             self._result(f"  {host} ({ip}): program-id is from a different "
-                          f"run — not this board.")
+                          f"run — ruled out.")
         return None
 
     def _select_verify_target(self, boards):
@@ -2407,24 +2423,42 @@ class App(tk.Tk):
             have_token = bool(self.program_id)
             if have_token:
                 # Primary path: identify the board by the unique program-id
-                # token written during programming. This works even when
-                # re-programming a board already on the LAN. Discovery here
-                # just enumerates boards (snapshot=None so it returns
-                # promptly); we then SSH each one to find the token match,
-                # retrying because the freshly-programmed board may still be
-                # running firstrun.sh and not yet answer.
+                # token written during programming. Works even when
+                # re-programming a board already on the LAN.
+                #
+                # The board just programmed may still be running firstrun.sh
+                # when the operator clicks Verify, so this retries. Two
+                # things make the retry cheap:
+                #   - discovered boards ACCUMULATE across passes (a board
+                #     does not leave the LAN between retries), so we union
+                #     each pass into 'known' rather than re-discovering from
+                #     scratch;
+                #   - boards found to carry a DIFFERENT token are recorded
+                #     in 'ruled_out' and never SSH-probed again.
+                # So each retry only SSHes boards whose token is still
+                # unknown - in practice just the one still booting.
                 self._result("Identifying the programmed board by its "
                               "program-id token…\n")
                 token_deadline = time.time() + 300
                 ip, host = None, None
+                known = {}          # hostname(lower) -> (ip, host)
+                ruled_out = set()   # hostnames carrying a different token
                 while time.time() < token_deadline:
+                    self._set_verify_status(
+                        "Searching for the programmed board…", "#000")
                     boards = self._collect_all_boards(
                         template, deadline=time.time() + 60, snapshot=None)
-                    if boards:
+                    for b in boards:
+                        known[b[1].lower()] = b
+                    # Probe only boards whose token we don't already know.
+                    to_probe = [b for h, b in known.items()
+                                if h not in ruled_out]
+                    if to_probe:
                         self._result(
-                            f"Checking {len(boards)} gateway(s) for this "
-                            "run's program-id…")
-                        match = self._match_by_program_id(boards, user, pw)
+                            f"{len(known)} gateway(s) known; checking "
+                            f"{len(to_probe)} for this run's program-id…")
+                        match = self._match_by_program_id(
+                            to_probe, user, pw, ruled_out=ruled_out)
                         if match is not None:
                             ip, host = match
                             self._result(
@@ -2443,14 +2477,12 @@ class App(tk.Tk):
                     time.sleep(8)
 
                 if ip is None:
-                    # Token never matched. The board may be unreachable, or
-                    # firstrun.sh did not install the token. Fall back to the
-                    # snapshot diff / operator pick on whatever was found.
+                    # Token never matched within the deadline. Fall back to
+                    # the snapshot diff / operator pick on whatever is known.
                     self._result("Could not confirm the board by program-id. "
                                   "Falling back to manual selection.\n")
-                    boards = self._collect_all_boards(
-                        template, deadline=time.time() + 30, snapshot=None)
-                    ip, host = self._select_verify_target(boards)
+                    ip, host = self._select_verify_target(
+                        list(known.values()))
             else:
                 # No token this session (Verify run without a prior Program).
                 # Use the original snapshot-diff discovery + Option C pick.
@@ -2655,70 +2687,66 @@ class App(tk.Tk):
         (IPv4 only, hostname is the short name).
 
         Browses ONLY the _workstation._tcp service type - the type Raspberry
-        Pi OS advertises its hostname under. This is important: a bare
-        'avahi-browse -atrpk' resolves EVERY service on the network,
-        including printers and other devices whose resolves can time out
-        (e.g. a Brother printer's _privet/_ipp services), dragging the whole
-        call past its timeout and making it return nothing. Restricting to
-        _workstation._tcp keeps it fast and reliable.
+        Pi OS advertises its hostname under.
 
-        Handles BOTH record types from avahi-browse:
-          '=' resolved records - give the IP directly.
-          '+' found-but-unresolved records - happen when a board is still
-              booting (it announces its service but its mDNS responder
-              isn't answering address queries yet). For these we extract
-              the hostname from the service name and resolve it directly.
-              Without this, a freshly-booted board is invisible until its
-              service-resolve stops timing out.
+        IMPORTANT - why we browse WITHOUT '-r' (resolve):
+        'avahi-browse -r' makes avahi-browse resolve every service itself,
+        inside the one invocation. If ANY advertised host is slow to answer
+        address queries - which is exactly what a gateway does while it is
+        still booting: it advertises _workstation._tcp but its mDNS responder
+        is not answering resolves yet - that one host drags the whole call
+        past its timeout, and the function returns nothing. The result was
+        that a single booting board made EVERY board (including healthy,
+        fully-resolvable ones) invisible to mDNS, forcing a slow ping-sweep.
+
+        So we browse WITHOUT '-r' (instant: just the list of service names),
+        then resolve each host individually via _resolve_hostname(), which
+        has its own short per-host timeout. A board that won't resolve yet
+        simply yields no IP for itself - the others are unaffected.
 
         Returns [] on any failure (avahi missing, timeout, etc.)."""
         if not which("avahi-browse"):
             return []
         try:
+            # No '-r': return the service list only, do not resolve. This is
+            # fast and cannot be stalled by a slow-resolving host.
             out = subprocess.check_output(
-                ["avahi-browse", "_workstation._tcp", "-rptk"],
-                text=True, stderr=subprocess.DEVNULL, timeout=45)
+                ["avahi-browse", "_workstation._tcp", "-ptk"],
+                text=True, stderr=subprocess.DEVNULL, timeout=20)
         except subprocess.TimeoutExpired:
             self._result("(avahi-browse timed out)")
             return []
         except Exception:
             return []
 
-        by_host = {}        # short hostname(lower) -> ip
-        unresolved = set()  # short hostnames seen only as '+' records
-
+        # Without '-r' every record is a '+' (found, unresolved). Collect the
+        # distinct short hostnames, then resolve each one separately.
+        names = set()
         for line in out.splitlines():
-            f = line.split(";")
-            if line.startswith("="):
-                # =;iface;proto;name;type;domain;host;ip;port;txt
-                if len(f) < 8 or f[2] != "IPv4":
-                    continue
-                host = f[6].split(".")[0]
-                ip = f[7]
-                if host and ip and ":" not in ip:
-                    by_host[host.lower()] = ip
-            elif line.startswith("+"):
-                # +;iface;proto;name;type;domain
-                # The service name (field 3) is '<hostname>\032[MAC]' on
-                # Raspberry Pi OS - the leading token is the hostname.
-                if len(f) < 4:
-                    continue
-                svc = f[3]
-                # Hostname = text up to the first escaped space (\032) or
-                # literal space; strip any avahi backslash-escapes.
-                name = re.split(r"\\032| ", svc)[0]
-                name = re.sub(r"\\(\d{3})",
-                               lambda m: chr(int(m.group(1))), name)
-                name = name.split(".")[0].strip()
-                if name:
-                    unresolved.add(name.lower())
-
-        # For any host seen only as '+' (no '=' record), resolve it directly.
-        for name in unresolved:
-            if name in by_host:
+            if not line.startswith("+"):
                 continue
+            # +;iface;proto;name;type;domain
+            # The service name (field 3) is '<hostname>\032[MAC]' on
+            # Raspberry Pi OS - the leading token is the hostname.
+            f = line.split(";")
+            if len(f) < 4:
+                continue
+            svc = f[3]
+            # Hostname = text up to the first escaped space (\032) or literal
+            # space; strip any avahi backslash-escapes.
+            name = re.split(r"\\032| ", svc)[0]
+            name = re.sub(r"\\(\d{3})",
+                           lambda m: chr(int(m.group(1))), name)
+            name = name.split(".")[0].strip()
+            if name:
+                names.add(name.lower())
+
+        # Resolve each host individually. One host that won't resolve (e.g.
+        # still booting) does not affect the others.
+        by_host = {}
+        for name in names:
             ip = self._resolve_hostname(name)
-            if ip:
+            if ip and ":" not in ip:
                 by_host[name] = ip
 
         return [(ip, host) for host, ip in by_host.items()]
@@ -3468,3 +3496,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
