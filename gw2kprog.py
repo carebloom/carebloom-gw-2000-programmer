@@ -595,6 +595,12 @@ class App(tk.Tk):
         # before discovery starts. None = no program run this session.
         self.program_finished_at = None
 
+        # Set of CareBloom gateway hostnames already on the LAN at the moment
+        # programming started. Verify diffs the current LAN against this to
+        # identify the board that was JUST programmed (the new arrival),
+        # instead of guessing. None = no snapshot taken this session.
+        self.lan_snapshot = None
+
         # App installation
         self.app_zip_path = tk.StringVar(value="")
         self.app_name = tk.StringVar(value=DEFAULT_APP_NAME)
@@ -1479,6 +1485,18 @@ class App(tk.Tk):
             self.after(0, finish)
 
     def _do_program(self):
+        # Snapshot which CareBloom gateways are already on the LAN before we
+        # program this board. Verify will diff against this to identify the
+        # board just programmed (the new arrival on the network).
+        try:
+            template = self.hostname.get() or DEFAULT_HOSTNAME
+            self.lan_snapshot = self._snapshot_lan_boards(template)
+            self.log(f"LAN snapshot: {len(self.lan_snapshot)} CareBloom "
+                     f"gateway(s) already on the network before programming.")
+        except Exception as e:
+            self.lan_snapshot = None
+            self.log(f"(LAN snapshot skipped: {e})")
+
         # 1) rpiboot
         self._set_step(0, "running")
         self.log("=== Step 1: rpiboot ===")
@@ -2039,15 +2057,46 @@ class App(tk.Tk):
                           "Wait ~120 s after power-on.")
             return False
 
-        if len(boards) == 1:
+        # Identify which discovered board is the one just programmed.
+        # If a LAN snapshot was taken at program time, the new board is the
+        # arrival that wasn't on the network before. This is reliable even
+        # when other CareBloom gateways are already on the LAN.
+        snap = self.lan_snapshot
+        new_boards = None
+        if snap is not None:
+            new_boards = [b for b in boards if b[1].lower() not in snap]
+
+        if new_boards is not None and len(new_boards) == 1:
+            # Exactly one new arrival since programming - that's our board.
+            ip, host = new_boards[0]
+            self._result(f"Identified the newly-programmed gateway: "
+                          f"{host} at {ip}\n")
+        elif new_boards is not None and len(new_boards) == 0 and snap:
+            # Boards found, but none of them are new since programming -
+            # the board just programmed hasn't appeared on the network yet.
+            # Do NOT silently verify a pre-existing board.
+            self._result("The gateway just programmed is not on the network "
+                          "yet.")
+            self._result(f"Found only previously-known gateway(s): "
+                          + ", ".join(h for _, h in boards))
+            self._result("Wait a bit longer for it to finish booting, then "
+                          "click Find and Verify again.")
+            self._set_verify_status(
+                "Programmed gateway not on network yet — wait and retry.",
+                "#c00")
+            return False
+        elif len(boards) == 1:
+            # No usable snapshot, single board - use it.
             ip, host = boards[0]
             self._result(f"One gateway found: {host} at {ip}\n")
         else:
-            self._result(f"{len(boards)} gateways found - asking which one "
-                          "to verify.")
+            # No snapshot, or multiple new arrivals - ask the operator.
+            pick_list = new_boards if (new_boards) else boards
+            self._result(f"{len(pick_list)} candidate gateway(s) - asking "
+                          "which one to verify.")
             self._set_verify_status(
                 "Multiple gateways found — select one to verify.", "#a60")
-            chosen = self._ask_pick_board(boards)
+            chosen = self._ask_pick_board(pick_list)
             if not chosen:
                 self._result("Verification cancelled - no gateway selected.")
                 return False
@@ -2197,6 +2246,33 @@ class App(tk.Tk):
              .replace("{MACUPPER}", macup))
         h = re.sub(r"[^A-Za-z0-9-]", "", h)[:63].strip("-")
         return h
+
+    def _snapshot_lan_boards(self, hostname_template):
+        """Return the set of CareBloom gateway hostnames (lowercased) visible
+        on the LAN right now, via a single quick mDNS browse. Used to record
+        'what was already here' before programming, so Verify can later spot
+        the newly-programmed board as the new arrival. Best-effort: returns
+        an empty set if avahi-browse isn't available or finds nothing."""
+        prefix_l = hostname_template.split("{")[0].lower()
+        names = set()
+        if not which("avahi-browse"):
+            return names
+        try:
+            out = subprocess.check_output(
+                ["avahi-browse", "-atrpk"],
+                text=True, stderr=subprocess.DEVNULL, timeout=20)
+        except Exception:
+            return names
+        for line in out.splitlines():
+            if not line.startswith("="):
+                continue
+            f = line.split(";")
+            if len(f) < 8:
+                continue
+            host = f[6].split(".")[0]
+            if host.lower().startswith(prefix_l):
+                names.add(host.lower())
+        return names
 
     def _collect_all_boards(self, hostname_template, deadline):
         """Discover EVERY CareBloom gateway currently on the LAN and return a
