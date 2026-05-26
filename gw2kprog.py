@@ -1765,6 +1765,43 @@ class App(tk.Tk):
             "raspi-config nonint do_ssh 0 2>/dev/null || true",
             "rm -f /etc/ssh/sshd_config.d/rename_user.conf",
             "",
+            "# --- mDNS workstation advertisement (Avahi) ---------------------",
+            "# The GW2000 Programmer's Verify tab discovers gateways by",
+            "# browsing the _workstation._tcp mDNS service. Current Debian /",
+            "# Raspberry Pi OS ships avahi-daemon with publish-workstation=no",
+            "# by default, so a freshly-imaged board does NOT advertise that",
+            "# service and is invisible to discovery. Force it on here so",
+            "# every gateway this flasher produces is reliably discoverable.",
+            "AVAHI_CONF=/etc/avahi/avahi-daemon.conf",
+            'if [ -f "$AVAHI_CONF" ]; then',
+            "    if grep -qE '^[[:space:]]*#?[[:space:]]*publish-workstation' "
+            '"$AVAHI_CONF"; then',
+            "        # Key present (set to no, or commented out) - force to yes.",
+            "        sed -i -E "
+            "'s/^[[:space:]]*#?[[:space:]]*publish-workstation[[:space:]]*=.*/"
+            "publish-workstation=yes/' "
+            '"$AVAHI_CONF"',
+            "    elif grep -qE '^\\[publish\\]' \"$AVAHI_CONF\"; then",
+            "        # [publish] section exists but no key - add it there.",
+            "        sed -i -E '/^\\[publish\\]/a publish-workstation=yes' "
+            '"$AVAHI_CONF"',
+            "    else",
+            "        # No [publish] section at all - append one.",
+            '        printf \'\\n[publish]\\npublish-workstation=yes\\n\' '
+            '>> "$AVAHI_CONF"',
+            "    fi",
+            '    echo "Set publish-workstation=yes in $AVAHI_CONF"',
+            "else",
+            '    echo "WARNING: $AVAHI_CONF not found - is avahi-daemon '
+            'installed?" >&2',
+            "fi",
+            "# Make sure the daemon is enabled so the advertisement actually",
+            "# goes out after the reboot at the end of firstrun.sh.",
+            "systemctl unmask avahi-daemon.service avahi-daemon.socket "
+            "2>/dev/null || true",
+            "systemctl enable avahi-daemon.service 2>/dev/null || true",
+            "systemctl enable avahi-daemon.socket 2>/dev/null || true",
+            "",
         ]
         if ssid:
             firstrun += [
@@ -3246,3 +3283,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
