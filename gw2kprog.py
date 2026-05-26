@@ -1986,24 +1986,54 @@ class App(tk.Tk):
                       + (f" — hostname: {host}" if host else "")
                       + "\n")
 
+        # Patient SSH connect. The board may be found on the network (ARP /
+        # mDNS) while it is still booting - sshd comes up late, after
+        # firstrun.sh and the first-boot reboot. "Connection refused" on
+        # port 22 is a transient mid-boot state, not a failure, so keep
+        # retrying for a while rather than giving up after a few tries.
+        # An AUTHENTICATION failure, by contrast, is real (wrong password) -
+        # retrying won't help, so stop immediately on that.
         client = None
         last_err = None
-        for attempt in range(8):
+        ssh_deadline = time.time() + 180   # retry sshd for up to 3 minutes
+        attempt = 0
+        while time.time() < ssh_deadline:
+            attempt += 1
             try:
                 client = paramiko.SSHClient()
                 client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
                 client.connect(hostname=ip, username=user, password=pw,
-                               timeout=10, allow_agent=False, look_for_keys=False)
+                               timeout=10, allow_agent=False,
+                               look_for_keys=False)
+                break
+            except paramiko.AuthenticationException as e:
+                # Wrong credentials - retrying is pointless.
+                last_err = e
+                self._result(f"SSH authentication failed: {e}")
+                self._result("Check the username / password on the "
+                              "Configure tab.")
+                client = None
                 break
             except Exception as e:
                 last_err = e
-                self._result(f"SSH attempt {attempt+1} failed: {e}")
-                time.sleep(10)
                 client = None
+                remaining = int(ssh_deadline - time.time())
+                if remaining <= 0:
+                    break
+                self._result(
+                    f"SSH not ready yet (attempt {attempt}): {e}")
+                self._set_verify_status(
+                    f"Board found — waiting for SSH to come up "
+                    f"(~{remaining}s left)", "#a60")
+                time.sleep(5)
         if client is None:
-            self._result(f"\nCould not SSH in. Last error: {last_err}")
+            self._result(f"\nCould not SSH in after {attempt} attempts. "
+                          f"Last error: {last_err}")
+            self._result("The board was found on the network but SSH never "
+                          "became reachable. If it was still booting, wait "
+                          "a moment and run Find and Verify again.")
             return False
-        self._result("SSH OK.\n")
+        self._result(f"SSH OK (after {attempt} attempt(s)).\n")
 
         checks = [
             ("Identity",    "cat /etc/os-release | head -5"),
