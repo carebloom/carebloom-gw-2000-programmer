@@ -177,7 +177,7 @@ def lsblk_json():
     try:
         out = subprocess.check_output(
             ["lsblk", "-J", "-b", "-o",
-             "NAME,SIZE,TYPE,RM,RO,TRAN,MODEL,VENDOR,MOUNTPOINT,HOTPLUG"],
+             "NAME,SIZE,TYPE,RM,RO,TRAN,MODEL,VENDOR,MOUNTPOINT,HOTPLUG,LABEL"],
             text=True,
         )
         return json.loads(out).get("blockdevices", [])
@@ -315,19 +315,24 @@ def find_bootfs_mount(disk_path, deadline):
             for child in d.get("children", []) or []:
                 cp = f"/dev/{child.get('name')}"
                 mp = child.get("mountpoint")
-                # bootfs is FAT32. We can't tell label from lsblk -o easily,
-                # so we just look at the first FAT partition (which is bootfs).
-                # First, try to read the partition's label/fstype via blkid.
-                try:
-                    blkid = subprocess.check_output(
-                        ["sudo", "blkid", "-o", "export", cp],
-                        text=True, stderr=subprocess.DEVNULL)
-                    info = {k: v for k, v in (
-                        line.split("=", 1) for line in blkid.splitlines()
-                        if "=" in line)}
-                except Exception:
-                    info = {}
-                if info.get("LABEL", "").lower() != "bootfs":
+                # bootfs is the FAT32 boot partition. Prefer the label that
+                # lsblk now reports directly (LABEL is in the -o list); only
+                # fall back to 'sudo blkid' if lsblk hasn't picked the label
+                # up yet (can happen right after dd rewrites the partition
+                # table, before udev re-probes).
+                label = (child.get("label") or "")
+                if not label:
+                    try:
+                        blkid = subprocess.check_output(
+                            ["sudo", "blkid", "-o", "export", cp],
+                            text=True, stderr=subprocess.DEVNULL)
+                        info = {k: v for k, v in (
+                            line.split("=", 1) for line in blkid.splitlines()
+                            if "=" in line)}
+                    except Exception:
+                        info = {}
+                    label = info.get("LABEL", "")
+                if label.lower() != "bootfs":
                     continue
                 if mp:
                     return mp
@@ -773,7 +778,7 @@ class App(tk.Tk):
 
         step_defs = [
             ("Detect gateway via rpiboot",
-             "Plug USB-C into this Pi (BOOT jumper ON; the cable powers the board)."),
+             "Plug USB-C into this Pi (BOOT switch ON; the cable powers the board)."),
             ("Identify eMMC",
              "Confirm a small (~8/16/32 GB) USB disk appears."),
             ("Unmount any partitions",
@@ -1477,7 +1482,7 @@ class App(tk.Tk):
                     # hold off discovery until the board has had time to boot.
                     self.program_finished_at = time.time()
                     self.program_status.configure(
-                        text="✓ Program complete. Remove BOOT jumper, "
+                        text="✓ Program complete. Set BOOT switch to OFF, "
                              "connect Ethernet, power-cycle, then go to Verify.",
                         foreground="#080")
                     self.notebook.select(self.verify_tab)
@@ -1507,7 +1512,7 @@ class App(tk.Tk):
             ["sudo", self.rpiboot_path.get(), "-d", self.bootfiles_dir.get()],
             self.log, timeout=180)
         if rc != 0:
-            self.log("rpiboot failed. Check: BOOT jumper fitted, and the "
+            self.log("rpiboot failed. Check: BOOT switch ON, and the "
                      "USB-C cable plugged into this Pi AFTER rpiboot started "
                      "(the cable powers the board).")
             self._set_step(0, "fail")
@@ -1624,7 +1629,7 @@ class App(tk.Tk):
                 continue
             for child in d.get("children", []) or []:
                 if (child.get("mountpoint") == mountpoint
-                        or child.get("label", "").lower() == "bootfs"):
+                        or (child.get("label") or "").lower() == "bootfs"):
                     return f"/dev/{child.get('name')}"
         return node + "1"
 
@@ -2125,7 +2130,7 @@ class App(tk.Tk):
         """
         if not boards:
             self._result("Could not find any gateway within 5 minutes.")
-            self._result("Check: BOOT jumper REMOVED, Ethernet connected, "
+            self._result("Check: BOOT switch OFF, Ethernet connected, "
                           "5V/3A USB-C supply powering the board.")
             return None, None
 
@@ -2735,7 +2740,7 @@ class App(tk.Tk):
                     return record_found(ip, host)
                 time.sleep(5)
                 continue
-            for net in local_subnets():
+            for net in subs:
                 try:
                     network = ipaddress.ip_network(net)
                 except Exception:
