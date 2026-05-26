@@ -1970,6 +1970,7 @@ class App(tk.Tk):
             ttk.Button(btns, text="Cancel",
                        command=cancel).pack(side="right", padx=4)
             lb.bind("<Double-Button-1>", lambda e: choose())
+            dlg.bind("<Escape>", lambda e: cancel())
             dlg.protocol("WM_DELETE_WINDOW", cancel)
 
         self.after(0, show)
@@ -2046,6 +2047,7 @@ class App(tk.Tk):
             ttk.Button(btns, text="Cancel",
                        command=cancel).pack(side="right", padx=4)
             ent.bind("<Return>", lambda e: ok())
+            dlg.bind("<Escape>", lambda e: cancel())
             dlg.protocol("WM_DELETE_WINDOW", cancel)
 
         self.after(0, show)
@@ -2053,20 +2055,56 @@ class App(tk.Tk):
         return result.get("target")
 
     def _manual_verify_entry(self):
-        """Handler for the 'Enter MAC Manually' button. Asks for a target
-        and, if given, runs verification against it - skipping discovery."""
-        target = self._ask_manual_target()
-        if not target:
-            return
-        self._start_transcript(VERIFY_LOG, "GW2000 Verify (manual)")
-        self.verify_btn.configure(state="disabled")
-        self.verify_results.configure(state="normal")
-        self.verify_results.delete("1.0", "end")
-        self.verify_status.configure(text="Verifying entered gateway…",
-                                      foreground="#0a7")
-        threading.Thread(
-            target=lambda: self._verify_workflow(manual_target=target),
-            daemon=True).start()
+        """Handler for the 'Enter MAC Manually' button. Runs on the UI
+        thread, so it must NOT call the blocking _ask_manual_target directly
+        (that would deadlock: _ask_manual_target marshals the dialog onto the
+        UI thread and then waits, but the UI thread would be blocked here).
+        Instead, do all of it - prompt and verify - in a worker thread."""
+
+        def worker():
+            target = self._ask_manual_target()
+            if not target:
+                return
+            self._start_transcript(VERIFY_LOG, "GW2000 Verify (manual)")
+            self.after(0, lambda: (
+                self.verify_btn.configure(state="disabled"),
+                self.verify_results.configure(state="normal"),
+                self.verify_results.delete("1.0", "end"),
+                self.verify_status.configure(
+                    text="Verifying entered gateway…", foreground="#0a7")))
+            ok = False
+            try:
+                ok = self._do_verify(manual_target=target)
+            except Exception as e:
+                self._result(f"EXCEPTION: {e}")
+            self._verify_finish(ok)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _verify_finish(self, ok):
+        """Apply the PASS/FAIL outcome to the Verify tab. Thread-safe -
+        marshals the UI update onto the UI thread. Shared by the Find and
+        Verify path and the manual-entry path."""
+        def finish():
+            self.verify_btn.configure(state="normal")
+            if ok:
+                self.verify_status.configure(
+                    text="✓ PASS — board is up and healthy.",
+                    foreground="#080")
+                # Autofill the downstream tabs from the verified board so
+                # the operator doesn't have to press "Use verified board".
+                target = (self.found_host.get().strip()
+                          or self.found_ip.get().strip())
+                if target:
+                    self.install_host.set(target)
+                mac = getattr(self, "found_mac", "") or ""
+                if mac:
+                    self.label_mac.set(mac)
+            else:
+                self.verify_status.configure(
+                    text="✗ FAIL — see results above.",
+                    foreground="#c00")
+        self.after(0, finish)
 
     def _verify_workflow(self, manual_target=None):
         ok = False
@@ -2075,26 +2113,7 @@ class App(tk.Tk):
         except Exception as e:
             self._result(f"EXCEPTION: {e}")
         finally:
-            def finish():
-                self.verify_btn.configure(state="normal")
-                if ok:
-                    self.verify_status.configure(
-                        text="✓ PASS — board is up and healthy.",
-                        foreground="#080")
-                    # Autofill the downstream tabs from the verified board so
-                    # the operator doesn't have to press "Use verified board".
-                    target = (self.found_host.get().strip()
-                              or self.found_ip.get().strip())
-                    if target:
-                        self.install_host.set(target)
-                    mac = getattr(self, "found_mac", "") or ""
-                    if mac:
-                        self.label_mac.set(mac)
-                else:
-                    self.verify_status.configure(
-                        text="✗ FAIL — see results above.",
-                        foreground="#c00")
-            self.after(0, finish)
+            self._verify_finish(ok)
 
     def _select_verify_target(self, boards):
         """Given the list of discovered (ip, hostname) gateways, decide which
