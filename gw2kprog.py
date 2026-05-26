@@ -1496,16 +1496,31 @@ class App(tk.Tk):
         # Snapshot which CareBloom gateways are already on the LAN before we
         # program this board. Verify will diff against this to identify the
         # board just programmed (the new arrival on the network).
-        try:
-            template = self.hostname.get() or DEFAULT_HOSTNAME
-            self.lan_snapshot = self._snapshot_lan_boards(template)
-            self.log(f"LAN snapshot: {len(self.lan_snapshot)} CareBloom "
-                     f"gateway(s) already on the network before programming.")
-        except Exception as e:
-            self.lan_snapshot = None
-            self.log(f"(LAN snapshot skipped: {e})")
+        #
+        # The snapshot is a synchronous avahi-browse pass that takes a couple
+        # of seconds. rpiboot (Step 1) does not depend on it, so we run the
+        # snapshot in a background thread and let it overlap rpiboot instead
+        # of adding its delay before programming visibly begins. The thread
+        # is joined right after rpiboot, long before Verify ever reads
+        # self.lan_snapshot.
+        self.lan_snapshot = None
+        snapshot_done = threading.Event()
 
-        # 1) rpiboot
+        def snapshot_worker():
+            try:
+                template = self.hostname.get() or DEFAULT_HOSTNAME
+                self.lan_snapshot = self._snapshot_lan_boards(template)
+            except Exception as e:
+                self.lan_snapshot = None
+                self._snapshot_error = e
+            finally:
+                snapshot_done.set()
+
+        self._snapshot_error = None
+        snapshot_thread = threading.Thread(target=snapshot_worker, daemon=True)
+        snapshot_thread.start()
+
+        # 1) rpiboot  (runs concurrently with the LAN snapshot above)
         self._set_step(0, "running")
         self.log("=== Step 1: rpiboot ===")
         rc, _ = run_stream(
@@ -1518,6 +1533,19 @@ class App(tk.Tk):
             self._set_step(0, "fail")
             return False
         self._set_step(0, "ok")
+
+        # The snapshot has almost certainly finished during rpiboot; wait for
+        # it (briefly) so self.lan_snapshot is settled before the workflow
+        # continues. Cap the wait so a hung avahi-browse can't stall the run.
+        if not snapshot_done.wait(timeout=20):
+            self.log("(LAN snapshot still running after rpiboot — "
+                     "continuing without it.)")
+            self.lan_snapshot = None
+        elif self._snapshot_error is not None:
+            self.log(f"(LAN snapshot skipped: {self._snapshot_error})")
+        else:
+            self.log(f"LAN snapshot: {len(self.lan_snapshot)} CareBloom "
+                     f"gateway(s) already on the network before programming.")
 
         # 2) find disk
         self._set_step(1, "running")
@@ -3283,4 +3311,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
