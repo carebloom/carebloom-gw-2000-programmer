@@ -1906,6 +1906,55 @@ class App(tk.Tk):
         self.after(0, lambda: self.verify_status.configure(
             text=text, foreground=color))
 
+    def _ask_pick_board(self, boards):
+        """Show a modal dialog listing discovered gateways and let the
+        operator pick the one they just programmed. Called from the verify
+        worker thread - marshals the dialog onto the UI thread and blocks
+        until the operator chooses. Returns the chosen (ip, hostname) tuple,
+        or None if cancelled."""
+        result = {}
+        done = threading.Event()
+
+        def show():
+            dlg = tk.Toplevel(self)
+            dlg.title("Select the gateway to verify")
+            dlg.transient(self)
+            dlg.grab_set()
+            ttk.Label(dlg, padding=12, justify="left",
+                      text=("More than one CareBloom gateway was found on "
+                            "the network.\nSelect the one you just "
+                            "programmed:")).pack(anchor="w")
+            lb = tk.Listbox(dlg, height=min(10, len(boards)), width=46,
+                            font=("DejaVu Sans Mono", 11))
+            for ip, host in boards:
+                lb.insert("end", f"{host}   ({ip})")
+            lb.selection_set(0)
+            lb.pack(padx=12, pady=4, fill="both", expand=True)
+
+            def choose():
+                sel = lb.curselection()
+                if sel:
+                    result["board"] = boards[sel[0]]
+                done.set()
+                dlg.destroy()
+
+            def cancel():
+                done.set()
+                dlg.destroy()
+
+            btns = ttk.Frame(dlg, padding=12)
+            btns.pack(fill="x")
+            ttk.Button(btns, text="Verify this gateway",
+                       command=choose).pack(side="left", padx=4)
+            ttk.Button(btns, text="Cancel",
+                       command=cancel).pack(side="right", padx=4)
+            lb.bind("<Double-Button-1>", lambda e: choose())
+            dlg.protocol("WM_DELETE_WINDOW", cancel)
+
+        self.after(0, show)
+        done.wait()
+        return result.get("board")
+
     def _verify_workflow(self):
         ok = False
         try:
@@ -1979,21 +2028,43 @@ class App(tk.Tk):
                     "immediately.\n")
 
         self._result(f"Hostname template: {template}")
-        self._result("Final hostname depends on the gateway's Ethernet MAC,")
-        self._result("so we search by Pi MAC OUI on the LAN…\n")
-        ip, host = self._find_board_by_mac(template,
-                                            deadline=time.time() + 300)
-        if not ip:
-            self._result("Could not find the board within 5 minutes.")
+        self._result("Each gateway names itself CareBloom<eth0-MAC>, so we "
+                      "list every CareBloom gateway on the LAN…\n")
+        boards = self._collect_all_boards(template,
+                                          deadline=time.time() + 300)
+        if not boards:
+            self._result("Could not find any gateway within 5 minutes.")
             self._result("Check: BOOT jumper REMOVED, Ethernet connected, "
                           "5V/3A USB-C supply powering the board. "
                           "Wait ~120 s after power-on.")
             return False
+
+        if len(boards) == 1:
+            ip, host = boards[0]
+            self._result(f"One gateway found: {host} at {ip}\n")
+        else:
+            self._result(f"{len(boards)} gateways found - asking which one "
+                          "to verify.")
+            self._set_verify_status(
+                "Multiple gateways found — select one to verify.", "#a60")
+            chosen = self._ask_pick_board(boards)
+            if not chosen:
+                self._result("Verification cancelled - no gateway selected.")
+                return False
+            ip, host = chosen
+            self._result(f"Selected: {host} at {ip}\n")
+            self._set_verify_status("Verifying selected gateway…", "#000")
+
+        # Record for other tabs (Label Generation 'Use verified board's MAC').
         self.found_ip.set(ip)
         self.found_host.set(host or "")
-        self._result(f"Found board at {ip}"
-                      + (f" — hostname: {host}" if host else "")
-                      + "\n")
+        if host:
+            hex_only = re.sub(r"[^0-9A-Fa-f]", "", host)
+            if len(hex_only) >= 12:
+                try:
+                    self.found_mac = format_mac_colons(hex_only[-12:])
+                except ValueError:
+                    self.found_mac = hex_only[-12:]
 
         # Patient SSH connect. The board may be found on the network (ARP /
         # mDNS) while it is still booting - sshd comes up late, after
@@ -2126,6 +2197,125 @@ class App(tk.Tk):
              .replace("{MACUPPER}", macup))
         h = re.sub(r"[^A-Za-z0-9-]", "", h)[:63].strip("-")
         return h
+
+    def _collect_all_boards(self, hostname_template, deadline):
+        """Discover EVERY CareBloom gateway currently on the LAN and return a
+        list of (ip, hostname) tuples, deduplicated by hostname.
+
+        Unlike the old 'grab the first match' approach, this returns all of
+        them so the operator can pick the board they just programmed - the
+        LAN may have several CareBloom gateways from earlier sessions, and
+        silently picking the first leads to verifying the wrong board.
+
+        Retries until at least one board is found or the deadline passes.
+        """
+        prefix = hostname_template.split("{")[0]
+        prefix_l = prefix.lower()
+        self._result(f"Discovering all gateways with names starting "
+                      f"'{prefix}'...")
+
+        found = {}   # hostname(lower) -> (ip, hostname)
+
+        def add(ip, host):
+            if not ip or not host:
+                return
+            if ":" in ip:        # skip IPv6
+                return
+            if host.lower().startswith(prefix_l):
+                found[host.lower()] = (ip, host)
+
+        def mdns_browse_all():
+            """avahi-browse enumerates every mDNS host in one shot."""
+            if not which("avahi-browse"):
+                return
+            try:
+                out = subprocess.check_output(
+                    ["avahi-browse", "-atrpk"],
+                    text=True, stderr=subprocess.DEVNULL, timeout=20)
+            except Exception:
+                return
+            for line in out.splitlines():
+                if not line.startswith("="):
+                    continue
+                f = line.split(";")
+                if len(f) < 8:
+                    continue
+                add(f[7], f[6].split(".")[0])
+
+        def arp_sweep_all():
+            """Ping-sweep local subnets, then resolve every responding host's
+            name and keep the CareBloom ones."""
+            for net in local_subnets():
+                try:
+                    network = ipaddress.ip_network(net)
+                except Exception:
+                    continue
+                hosts = list(network.hosts())
+                if len(hosts) > 512:
+                    self._result(f"Skipping ping-sweep of {net}: too large "
+                                  f"({len(hosts)} hosts). Relying on mDNS.")
+                    continue
+                self._result(f"Scanning {net} ({len(hosts)} hosts)...")
+                threads = []
+                for ipa in hosts:
+                    t = threading.Thread(
+                        target=lambda i=str(ipa): subprocess.call(
+                            ["ping", "-c", "1", "-W", "1", i],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL),
+                        daemon=True)
+                    t.start()
+                    threads.append(t)
+                    if len(threads) >= 64:
+                        for tt in threads:
+                            tt.join()
+                        threads = []
+                for tt in threads:
+                    tt.join()
+                try:
+                    arp = subprocess.check_output(
+                        ["ip", "neigh", "show"], text=True)
+                except Exception:
+                    arp = ""
+                for line in arp.splitlines():
+                    m = re.match(r"^(\d+\.\d+\.\d+\.\d+)\s", line)
+                    if not m:
+                        continue
+                    ipa = m.group(1)
+                    name = ""
+                    if which("avahi-resolve"):
+                        try:
+                            o = subprocess.check_output(
+                                ["avahi-resolve", "-a", ipa],
+                                text=True, stderr=subprocess.DEVNULL,
+                                timeout=5)
+                            p = o.split()
+                            if len(p) >= 2:
+                                name = p[1].split(".")[0]
+                        except Exception:
+                            pass
+                    if not name:
+                        try:
+                            name = socket.gethostbyaddr(
+                                ipa)[0].split(".")[0]
+                        except Exception:
+                            name = ""
+                    add(ipa, name)
+
+        while time.time() < deadline:
+            self._result("Browsing mDNS...")
+            mdns_browse_all()
+            if not found:
+                # mDNS came up empty - fall back to a ping-sweep.
+                arp_sweep_all()
+            if found:
+                boards = sorted(found.values(), key=lambda b: b[1].lower())
+                self._result(f"Found {len(boards)} gateway(s): "
+                              + ", ".join(h for _, h in boards))
+                return boards
+            self._result("No gateways found yet; retrying...")
+            time.sleep(5)
+        return []
 
     def _find_board_by_mac(self, hostname_template, deadline):
         """Find the freshly-programmed board on the LAN. Returns (ip, hostname).
