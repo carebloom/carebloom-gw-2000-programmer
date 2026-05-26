@@ -2049,7 +2049,8 @@ class App(tk.Tk):
         self._result("Each gateway names itself CareBloom<eth0-MAC>, so we "
                       "list every CareBloom gateway on the LAN…\n")
         boards = self._collect_all_boards(template,
-                                          deadline=time.time() + 300)
+                                          deadline=time.time() + 300,
+                                          snapshot=self.lan_snapshot)
         if not boards:
             self._result("Could not find any gateway within 5 minutes.")
             self._result("Check: BOOT jumper REMOVED, Ethernet connected, "
@@ -2302,16 +2303,14 @@ class App(tk.Tk):
                 names.add(host.lower())
         return names
 
-    def _collect_all_boards(self, hostname_template, deadline):
-        """Discover EVERY CareBloom gateway currently on the LAN and return a
-        list of (ip, hostname) tuples, deduplicated by hostname.
+    def _collect_all_boards(self, hostname_template, deadline,
+                            snapshot=None):
+        """Discover CareBloom gateways on the LAN; return [(ip, hostname)].
 
-        Unlike the old 'grab the first match' approach, this returns all of
-        them so the operator can pick the board they just programmed - the
-        LAN may have several CareBloom gateways from earlier sessions, and
-        silently picking the first leads to verifying the wrong board.
-
-        Retries until at least one board is found or the deadline passes.
+        If snapshot is given (the set of gateway hostnames present before
+        programming), keeps retrying until a board NOT in the snapshot
+        appears - the newly-programmed board - or the deadline passes. If
+        snapshot is None, returns as soon as any board is found.
         """
         prefix = hostname_template.split("{")[0]
         prefix_l = prefix.lower()
@@ -2401,11 +2400,42 @@ class App(tk.Tk):
                 arp_sweep_all()
             if found:
                 boards = sorted(found.values(), key=lambda b: b[1].lower())
+                # If we have a snapshot of what was on the LAN before
+                # programming, keep retrying until a board that ISN'T in the
+                # snapshot appears - that new arrival is the board just
+                # programmed. Returning as soon as ANY board is found would
+                # give up too early when a pre-existing gateway answers
+                # first and the freshly-programmed board is still booting.
+                if snapshot is not None:
+                    new = [b for b in boards
+                           if b[1].lower() not in snapshot]
+                    if new:
+                        self._result(
+                            f"Found {len(boards)} gateway(s); "
+                            f"{len(new)} new since programming: "
+                            + ", ".join(h for _, h in new))
+                        return boards
+                    remaining = int(deadline - time.time())
+                    self._result(
+                        f"Found only previously-known gateway(s): "
+                        + ", ".join(h for _, h in boards)
+                        + f". Waiting for the new board to appear "
+                        f"(~{remaining}s left)...")
+                    self._set_verify_status(
+                        f"Waiting for the programmed gateway to come "
+                        f"online (~{remaining}s left)", "#a60")
+                    time.sleep(5)
+                    continue
+                # No snapshot - return as soon as any board is found.
                 self._result(f"Found {len(boards)} gateway(s): "
                               + ", ".join(h for _, h in boards))
                 return boards
             self._result("No gateways found yet; retrying...")
             time.sleep(5)
+        # Deadline passed. Return whatever we have (may be only old boards,
+        # or nothing) - the caller decides how to report it.
+        if found:
+            return sorted(found.values(), key=lambda b: b[1].lower())
         return []
 
     def _find_board_by_mac(self, hostname_template, deadline):
