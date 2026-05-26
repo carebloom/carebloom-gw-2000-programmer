@@ -2247,6 +2247,48 @@ class App(tk.Tk):
         h = re.sub(r"[^A-Za-z0-9-]", "", h)[:63].strip("-")
         return h
 
+    def _avahi_browse_workstations(self):
+        """Browse mDNS for hosts and return a list of (ip, hostname) tuples
+        (IPv4 only, hostname is the short name).
+
+        Browses ONLY the _workstation._tcp service type - the type Raspberry
+        Pi OS advertises its hostname under. This is important: a bare
+        'avahi-browse -atrpk' resolves EVERY service on the network,
+        including printers and other devices whose resolves can time out
+        (e.g. a Brother printer's _privet/_ipp services), dragging the whole
+        call past its timeout and making it return nothing. Restricting to
+        _workstation._tcp keeps it fast and reliable.
+
+        Returns [] on any failure (avahi missing, timeout, etc.)."""
+        if not which("avahi-browse"):
+            return []
+        try:
+            out = subprocess.check_output(
+                ["avahi-browse", "_workstation._tcp", "-rptk"],
+                text=True, stderr=subprocess.DEVNULL, timeout=45)
+        except subprocess.TimeoutExpired:
+            self._result("(avahi-browse timed out)")
+            return []
+        except Exception:
+            return []
+        results = []
+        for line in out.splitlines():
+            # Resolved records start with '=' ; ';'-separated fields:
+            # =;iface;proto;name;type;domain;host;ip;port;txt
+            if not line.startswith("="):
+                continue
+            f = line.split(";")
+            if len(f) < 8:
+                continue
+            proto = f[2]
+            if proto != "IPv4":
+                continue
+            host = f[6].split(".")[0]
+            ip = f[7]
+            if host and ip and ":" not in ip:
+                results.append((ip, host))
+        return results
+
     def _snapshot_lan_boards(self, hostname_template):
         """Return the set of CareBloom gateway hostnames (lowercased) visible
         on the LAN right now, via a single quick mDNS browse. Used to record
@@ -2255,21 +2297,7 @@ class App(tk.Tk):
         an empty set if avahi-browse isn't available or finds nothing."""
         prefix_l = hostname_template.split("{")[0].lower()
         names = set()
-        if not which("avahi-browse"):
-            return names
-        try:
-            out = subprocess.check_output(
-                ["avahi-browse", "-atrpk"],
-                text=True, stderr=subprocess.DEVNULL, timeout=20)
-        except Exception:
-            return names
-        for line in out.splitlines():
-            if not line.startswith("="):
-                continue
-            f = line.split(";")
-            if len(f) < 8:
-                continue
-            host = f[6].split(".")[0]
+        for ip, host in self._avahi_browse_workstations():
             if host.lower().startswith(prefix_l):
                 names.add(host.lower())
         return names
@@ -2301,22 +2329,9 @@ class App(tk.Tk):
                 found[host.lower()] = (ip, host)
 
         def mdns_browse_all():
-            """avahi-browse enumerates every mDNS host in one shot."""
-            if not which("avahi-browse"):
-                return
-            try:
-                out = subprocess.check_output(
-                    ["avahi-browse", "-atrpk"],
-                    text=True, stderr=subprocess.DEVNULL, timeout=20)
-            except Exception:
-                return
-            for line in out.splitlines():
-                if not line.startswith("="):
-                    continue
-                f = line.split(";")
-                if len(f) < 8:
-                    continue
-                add(f[7], f[6].split(".")[0])
+            """Enumerate mDNS workstation hosts via the shared helper."""
+            for ip, host in self._avahi_browse_workstations():
+                add(ip, host)
 
         def arp_sweep_all():
             """Ping-sweep local subnets, then resolve every responding host's
@@ -2453,33 +2468,11 @@ class App(tk.Tk):
                 return ""
 
         def mdns_find_by_prefix():
-            """Enumerate mDNS hosts via avahi-browse and return (ip, name) for
-            the first whose hostname starts with the CareBloom prefix.
-
-            This needs no subnet scan, so it works regardless of the host's
-            netmask (a /16 LAN, etc.) - unlike the ping-sweep fallback below.
-            It is also the most reliable path: the board advertises itself
-            over mDNS as soon as avahi is up."""
-            if not which("avahi-browse"):
-                return None, None
-            try:
-                # -t terminate, -r resolve, -p parseable, -k no name lookups.
-                out = subprocess.check_output(
-                    ["avahi-browse", "-atrpk"],
-                    text=True, stderr=subprocess.DEVNULL, timeout=20)
-            except Exception:
-                return None, None
-            for line in out.splitlines():
-                # Resolved records start with '=' ; fields are ';'-separated:
-                # =;iface;proto;name;type;domain;host;ip;port;txt
-                if not line.startswith("="):
-                    continue
-                f = line.split(";")
-                if len(f) < 8:
-                    continue
-                host = f[6].split(".")[0]
-                ip = f[7]
-                if host.lower().startswith(prefix_l) and ":" not in ip:
+            """Return (ip, name) for the first mDNS workstation host whose
+            hostname starts with the CareBloom prefix, via the shared helper.
+            Netmask-independent - no subnet scan needed."""
+            for ip, host in self._avahi_browse_workstations():
+                if host.lower().startswith(prefix_l):
                     return ip, host
             return None, None
 
