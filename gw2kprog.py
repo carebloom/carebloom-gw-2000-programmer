@@ -2805,6 +2805,49 @@ class App(tk.Tk):
                 all_ok = False
         client.close()
 
+        # --- Hostname sanity check (QA gate) --------------------------------
+        # A correctly-programmed gateway must have a hostname of exactly
+        # 'CareBloom<12 hex>' - the bare name, no '.local', no '-2' suffix.
+        # A trailing '.local' means something set the hostname to the FQDN
+        # (e.g. an app-install 'hostnamectl set-hostname name.local'); a
+        # '-N' suffix means Avahi hit a name conflict and renamed the board.
+        # Either way the board is mis-identified and the Label tab would
+        # derive the wrong MAC, so this is a hard verify FAILURE - it stops
+        # a bad board from being packed and shipped.
+        hn = ""
+        try:
+            c3 = paramiko.SSHClient()
+            c3.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            c3.connect(hostname=ip, username=user, password=pw,
+                       timeout=10, allow_agent=False, look_for_keys=False)
+            _i, _o, _e = c3.exec_command("hostnamectl --static", timeout=10)
+            hn = _o.read().decode(errors="replace").strip()
+            c3.close()
+        except Exception as e:
+            self._result(f"=== Hostname check ===\n[error] {e}")
+            all_ok = False
+            hn = None
+
+        if hn is not None:
+            self._result("=== Hostname check ===")
+            self._result(f"static hostname: {hn or '(empty)'}")
+            if re.fullmatch(r"CareBloom[0-9A-Fa-f]{12}", hn):
+                self._result("hostname OK (CareBloom<MAC>, bare name).")
+            else:
+                all_ok = False
+                reason = "does not match CareBloom<12 hex>"
+                if hn.lower().endswith(".local"):
+                    reason = ("ends in '.local' — the app-install script set "
+                              "the hostname to the FQDN. Fix the "
+                              "'hostnamectl set-hostname' line in "
+                              "setupSystemLocal.sh to use the bare name.")
+                elif re.search(r"-\d+$", hn):
+                    reason = ("has a '-N' suffix — Avahi renamed the board "
+                              "after a name conflict. Check for a hard-set "
+                              "'host-name=' in avahi-daemon.conf, or another "
+                              "host using the same name.")
+                self._result(f"HOSTNAME FAIL: {reason}")
+
         try:
             new = not os.path.exists(LOG_FILE)
             with open(LOG_FILE, "a", newline="") as f:
@@ -3680,4 +3723,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
