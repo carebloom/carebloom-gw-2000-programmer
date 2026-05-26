@@ -24,6 +24,7 @@ import shlex
 import queue
 import socket
 import shutil
+import secrets
 import threading
 import subprocess
 import ipaddress
@@ -599,6 +600,13 @@ class App(tk.Tk):
         # the board has time to finish first boot (firstrun.sh + its reboot)
         # before discovery starts. None = no program run this session.
         self.program_finished_at = None
+
+        # Unique token written onto the board during the last Program run and
+        # copied by firstrun.sh to /etc/gw2k_program_id on the booted system.
+        # Verify reads it back over SSH to positively identify the board just
+        # programmed. None = no program run this session (Verify then falls
+        # back to the LAN-snapshot diff and, ultimately, an operator pick).
+        self.program_id = None
 
         # Set of CareBloom gateway hostnames already on the LAN at the moment
         # programming started. Verify diffs the current LAN against this to
@@ -1466,6 +1474,15 @@ class App(tk.Tk):
         self.program_results.configure(state="disabled")
         self.start_btn.configure(state="disabled")
         self.program_status.configure(text="Running…", foreground="#0a7")
+
+        # Unique token for THIS program run. It is written onto the board's
+        # boot partition and copied by firstrun.sh to /etc/gw2k_program_id on
+        # the booted system. Verify reads it back over SSH to identify the
+        # board just programmed - this works even when re-programming a board
+        # that was already on the LAN (the hostname/MAC are unchanged on a
+        # re-program, so the old "new arrival" snapshot diff could not).
+        self.program_id = secrets.token_hex(8)
+
         threading.Thread(target=self._program_workflow, daemon=True).start()
 
     def _program_workflow(self):
@@ -1917,6 +1934,24 @@ class App(tk.Tk):
             "systemctl disable bluetooth.service 2>/dev/null || true",
             "systemctl stop bluetooth.service 2>/dev/null || true",
             "",
+            "# --- Program-run identifier -------------------------------------",
+            "# The flasher wrote a unique token for this program run onto the",
+            "# boot partition. Copy it to /etc/gw2k_program_id so the Verify",
+            "# tab can read it back over SSH and positively identify THIS",
+            "# board - even on a re-program, where the hostname is unchanged.",
+            "for PIDF in /boot/firmware/gw2k_program_id /boot/gw2k_program_id; do",
+            '    if [ -r "$PIDF" ]; then',
+            '        cp "$PIDF" /etc/gw2k_program_id',
+            "        chmod 644 /etc/gw2k_program_id",
+            '        echo "program id installed: $(cat /etc/gw2k_program_id)"',
+            "        break",
+            "    fi",
+            "done",
+            "# Remove the boot-partition copy so a later re-program's token",
+            "# can't be confused with this one.",
+            "rm -f /boot/firmware/gw2k_program_id /boot/gw2k_program_id "
+            "2>/dev/null || true",
+            "",
             "# Self-destruct",
             "rm -f /boot/firmware/firstrun.sh /boot/firstrun.sh",
             "sed -i 's| systemd.run.*||g' /boot/firmware/cmdline.txt 2>/dev/null || true",
@@ -1946,6 +1981,24 @@ class App(tk.Tk):
                 f.write(pw_hash + "\n")
             run_stream(["sudo", "install", "-m", "0600", tmph, pwhash_path], self.log)
             os.unlink(tmph)
+
+            # Write this run's unique program-id token onto the boot
+            # partition. firstrun.sh copies it to /etc/gw2k_program_id and
+            # then deletes this boot-partition copy. Verify reads the token
+            # back over SSH to identify the board just programmed.
+            program_id = getattr(self, "program_id", None)
+            if program_id:
+                pid_path = os.path.join(bootfs, "gw2k_program_id")
+                tmpp = "/tmp/gw2k_program_id"
+                with open(tmpp, "w") as f:
+                    f.write(program_id + "\n")
+                run_stream(["sudo", "install", "-m", "0644", tmpp, pid_path],
+                           self.log)
+                os.unlink(tmpp)
+                self.log(f"Wrote program-id token: {program_id}")
+            else:
+                self.log("(No program-id token set — Verify will fall back "
+                         "to LAN-snapshot / operator pick.)")
 
             cmdline_path = os.path.join(bootfs, "cmdline.txt")
             with open(cmdline_path) as f:
@@ -2185,16 +2238,70 @@ class App(tk.Tk):
         finally:
             self._verify_finish(ok)
 
-    def _select_verify_target(self, boards):
-        """Given the list of discovered (ip, hostname) gateways, decide which
-        one to verify. Returns (ip, host), or (None, None) if no board could
-        be chosen (caller then offers manual entry).
+    def _read_program_id(self, ip, user, pw):
+        """SSH into a board and read /etc/gw2k_program_id. Returns the token
+        string, or None if it can't be read (board still booting, file not
+        there yet, SSH not up, wrong credentials, etc.). Never raises -
+        callers treat None as 'not this board / not ready'."""
+        client = None
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(hostname=ip, username=user, password=pw,
+                           timeout=8, allow_agent=False, look_for_keys=False)
+            stdin, stdout, stderr = client.exec_command(
+                "cat /etc/gw2k_program_id 2>/dev/null", timeout=10)
+            token = stdout.read().decode(errors="replace").strip()
+            return token or None
+        except Exception:
+            return None
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
-        Uses the LAN snapshot taken at program time: the board just
-        programmed is the arrival that wasn't on the network before.
+    def _match_by_program_id(self, boards, user, pw):
+        """Given discovered (ip, hostname) boards, SSH into each and look for
+        the one whose /etc/gw2k_program_id matches this session's token.
+
+        Returns:
+          (ip, host)            - the board carrying this run's token
+          None                  - token known, but no board has it yet
+                                   (caller should keep waiting / retry)
+        Only called when self.program_id is set.
+        """
+        want = self.program_id
+        for ip, host in boards:
+            tok = self._read_program_id(ip, user, pw)
+            if tok is None:
+                self._result(f"  {host} ({ip}): no program-id readable yet.")
+                continue
+            if tok == want:
+                self._result(f"  {host} ({ip}): program-id MATCH.")
+                return ip, host
+            self._result(f"  {host} ({ip}): program-id is from a different "
+                          f"run — not this board.")
+        return None
+
+    def _select_verify_target(self, boards):
+        """Fallback target selector, used when program-id matching did not
+        identify the board (no token this session, or the token could not be
+        read - e.g. the board is still booting). Given the discovered
+        (ip, hostname) gateways, decide which one to verify.
+
+        Returns (ip, host), or (None, None) if no board could be chosen
+        (caller then offers manual entry).
+
+        Strategy:
+          1. LAN-snapshot diff: if exactly one board is new since
+             programming, use it.
+          2. If exactly one board exists at all, use it.
+          3. Otherwise (Option C): ask the operator to pick from the list.
         """
         if not boards:
-            self._result("Could not find any gateway within 5 minutes.")
+            self._result("Could not find any gateway within the time limit.")
             self._result("Check: BOOT switch OFF, Ethernet connected, "
                           "5V/3A USB-C supply powering the board.")
             return None, None
@@ -2206,30 +2313,28 @@ class App(tk.Tk):
 
         if new_boards is not None and len(new_boards) == 1:
             ip, host = new_boards[0]
-            self._result(f"Identified the newly-programmed gateway: "
-                          f"{host} at {ip}\n")
+            self._result(f"Identified the newly-programmed gateway by LAN "
+                          f"snapshot: {host} at {ip}\n")
             return ip, host
-        if new_boards is not None and len(new_boards) == 0 and snap:
-            self._result("The gateway just programmed is not on the network "
-                          "yet.")
-            self._result("Found only previously-known gateway(s): "
-                          + ", ".join(h for _, h in boards))
-            return None, None
         if len(boards) == 1:
             ip, host = boards[0]
             self._result(f"One gateway found: {host} at {ip}\n")
             return ip, host
-        # Multiple candidates - ask the operator to pick.
+
+        # Option C: more than one candidate and no automatic way to tell them
+        # apart - ask the operator which board they just programmed. This is
+        # the safety net for the re-program case (the board's hostname is
+        # unchanged, so the snapshot diff can't single it out).
         pick_list = new_boards if new_boards else boards
-        self._result(f"{len(pick_list)} candidate gateway(s) - asking which "
-                      "one to verify.")
+        self._result(f"{len(pick_list)} candidate gateway(s) on the LAN and "
+                      "no automatic match — asking the operator to pick.")
         self._set_verify_status(
-            "Multiple gateways found — select one to verify.", "#a60")
+            "Select the gateway you just programmed.", "#a60")
         chosen = self._ask_pick_board(pick_list)
         if not chosen:
             return None, None
         ip, host = chosen
-        self._result(f"Selected: {host} at {ip}\n")
+        self._result(f"Operator selected: {host} at {ip}\n")
         return ip, host
 
     def _do_verify(self, manual_target=None):
@@ -2298,13 +2403,65 @@ class App(tk.Tk):
                         "discovery immediately.\n")
 
             self._result(f"Hostname template: {template}")
-            self._result("Each gateway names itself CareBloom<eth0-MAC>, so "
-                          "we list every CareBloom gateway on the LAN…\n")
-            boards = self._collect_all_boards(
-                template, deadline=time.time() + 300,
-                snapshot=self.lan_snapshot)
 
-            ip, host = self._select_verify_target(boards)
+            have_token = bool(self.program_id)
+            if have_token:
+                # Primary path: identify the board by the unique program-id
+                # token written during programming. This works even when
+                # re-programming a board already on the LAN. Discovery here
+                # just enumerates boards (snapshot=None so it returns
+                # promptly); we then SSH each one to find the token match,
+                # retrying because the freshly-programmed board may still be
+                # running firstrun.sh and not yet answer.
+                self._result("Identifying the programmed board by its "
+                              "program-id token…\n")
+                token_deadline = time.time() + 300
+                ip, host = None, None
+                while time.time() < token_deadline:
+                    boards = self._collect_all_boards(
+                        template, deadline=time.time() + 60, snapshot=None)
+                    if boards:
+                        self._result(
+                            f"Checking {len(boards)} gateway(s) for this "
+                            "run's program-id…")
+                        match = self._match_by_program_id(boards, user, pw)
+                        if match is not None:
+                            ip, host = match
+                            self._result(
+                                f"Confirmed by program-id: {host} at {ip}\n")
+                            break
+                    remaining = int(token_deadline - time.time())
+                    if remaining <= 0:
+                        break
+                    self._result(
+                        f"Programmed board not confirmed yet — it may still "
+                        f"be running first boot. Retrying (~{remaining}s "
+                        "left)…\n")
+                    self._set_verify_status(
+                        f"Waiting for the programmed board to finish first "
+                        f"boot (~{remaining}s left)", "#a60")
+                    time.sleep(8)
+
+                if ip is None:
+                    # Token never matched. The board may be unreachable, or
+                    # firstrun.sh did not install the token. Fall back to the
+                    # snapshot diff / operator pick on whatever was found.
+                    self._result("Could not confirm the board by program-id. "
+                                  "Falling back to manual selection.\n")
+                    boards = self._collect_all_boards(
+                        template, deadline=time.time() + 30, snapshot=None)
+                    ip, host = self._select_verify_target(boards)
+            else:
+                # No token this session (Verify run without a prior Program).
+                # Use the original snapshot-diff discovery + Option C pick.
+                self._result("Each gateway names itself CareBloom<eth0-MAC>, "
+                              "so we list every CareBloom gateway on the "
+                              "LAN…\n")
+                boards = self._collect_all_boards(
+                    template, deadline=time.time() + 300,
+                    snapshot=self.lan_snapshot)
+                ip, host = self._select_verify_target(boards)
+
             if ip is None:
                 # Discovery failed or operator declined - offer manual entry.
                 fb = self._ask_manual_target(
