@@ -2239,10 +2239,29 @@ class App(tk.Tk):
             self._verify_finish(ok)
 
     def _read_program_id(self, ip, user, pw):
-        """SSH into a board and read /etc/gw2k_program_id. Returns the token
-        string, or None if it can't be read (board still booting, file not
-        there yet, SSH not up, wrong credentials, etc.). Never raises -
-        callers treat None as 'not this board / not ready'."""
+        """SSH into a board and read /etc/gw2k_program_id.
+
+        Returns a (status, token) tuple so the caller can tell apart the
+        cases that need different handling:
+
+          ("TOKEN", "<value>") - SSH worked, token file read.
+          ("NO_TOKEN", None)   - SSH worked, but /etc/gw2k_program_id is not
+                                 there. The board is mid first-boot (before
+                                 firstrun.sh installs it) or is an old board.
+          ("AUTH_FAIL", None)  - SSH refused the configured credentials.
+                                 The freshly-programmed board always has the
+                                 configured password, so this is almost
+                                 certainly a finished gateway whose password
+                                 was changed late in test - i.e. NOT our
+                                 board.
+          ("UNREACHABLE", None)- Could not connect at all (connection
+                                 refused / timeout). The board is not up yet
+                                 - typically the freshly-programmed board
+                                 still booting.
+
+        Never raises."""
+        if paramiko is None:
+            return ("UNREACHABLE", None)
         client = None
         try:
             client = paramiko.SSHClient()
@@ -2252,9 +2271,14 @@ class App(tk.Tk):
             stdin, stdout, stderr = client.exec_command(
                 "cat /etc/gw2k_program_id 2>/dev/null", timeout=10)
             token = stdout.read().decode(errors="replace").strip()
-            return token or None
+            if token:
+                return ("TOKEN", token)
+            return ("NO_TOKEN", None)
+        except paramiko.AuthenticationException:
+            return ("AUTH_FAIL", None)
         except Exception:
-            return None
+            # Connection refused, timeout, no route, etc. - board not up yet.
+            return ("UNREACHABLE", None)
         finally:
             if client is not None:
                 try:
@@ -2262,44 +2286,162 @@ class App(tk.Tk):
                 except Exception:
                     pass
 
-    def _match_by_program_id(self, boards, user, pw, ruled_out=None):
-        """Given discovered (ip, hostname) boards, SSH into each and look for
-        the one whose /etc/gw2k_program_id matches this session's token.
+    def _sweep_lan_ips(self, progress_cb=None):
+        """Concurrent ARP/ping-sweep of every local /24-sized subnet. Returns
+        a set of live IPv4 addresses.
 
-        ruled_out, if given, is a set of hostnames already known to carry a
-        DIFFERENT valid token - those boards cannot be the target, so they
-        are skipped without re-probing. Hostnames found to carry a different
-        token are added to ruled_out so later retries skip them too.
+        This is the mDNS-INDEPENDENT discovery backbone: it finds every host
+        that answers a ping (or is already in the ARP table) regardless of
+        whether the host advertises any mDNS service. On the small factory
+        LAN (<=~16 gateways, a /24) a full concurrent sweep takes 1-2 s.
 
-        Returns:
-          (ip, host)            - the board carrying this run's token
-          None                  - no board has it yet (caller retries; a
-                                   board still booting will not have a
-                                   readable token until firstrun.sh runs)
+        Names are deliberately NOT resolved here - the program-id token probe
+        works purely from IPs, so there is no need to pay for name lookups.
+
+        progress_cb(done, total), if given, is called as the sweep advances
+        so the caller can show a live heartbeat."""
+        live = set()
+        for net in local_subnets():
+            try:
+                network = ipaddress.ip_network(net)
+            except Exception:
+                continue
+            hosts = [str(h) for h in network.hosts()]
+            if len(hosts) > 512:
+                # Too large to sweep host-by-host; skip (mDNS still covers it).
+                self._result(f"Subnet {net} too large to ping-sweep "
+                              f"({len(hosts)} hosts) — skipping sweep here.")
+                continue
+
+            total = len(hosts)
+            done = [0]
+            done_lock = threading.Lock()
+
+            def ping_one(ip):
+                rc = subprocess.call(
+                    ["ping", "-c", "1", "-W", "1", ip],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                with done_lock:
+                    done[0] += 1
+                    if progress_cb and (done[0] % 16 == 0
+                                        or done[0] == total):
+                        progress_cb(done[0], total)
+                return rc
+
+            # Sweep in batches so we cap concurrent ping processes.
+            threads = []
+            for ip in hosts:
+                t = threading.Thread(target=ping_one, args=(ip,),
+                                      daemon=True)
+                t.start()
+                threads.append(t)
+                if len(threads) >= 64:
+                    for tt in threads:
+                        tt.join()
+                    threads = []
+            for tt in threads:
+                tt.join()
+
+            # Collect everything the kernel now has an ARP entry for.
+            try:
+                arp = subprocess.check_output(["ip", "neigh", "show"],
+                                              text=True)
+            except Exception:
+                arp = ""
+            for line in arp.splitlines():
+                m = re.match(r"^(\d+\.\d+\.\d+\.\d+)\s", line)
+                if not m:
+                    continue
+                # Keep entries that look reachable (have a MAC / known state).
+                if "FAILED" in line or "INCOMPLETE" in line:
+                    continue
+                live.add(m.group(1))
+        return live
+
+    def _match_by_program_id(self, candidates, user, pw,
+                             ruled_out=None, auth_strikes=None):
+        """Given candidate (ip, host) boards, SSH each in parallel and look
+        for the one whose /etc/gw2k_program_id matches this run's token.
+
+        Everything is keyed by IP - a candidate from the ARP/ping-sweep may
+        have no hostname, but always has an IP.
+
+        ruled_out  : set of IPs already proven NOT to be our board - skipped
+                     without re-probing on later retries.
+        auth_strikes: dict {ip: count} tracking consecutive AUTH_FAIL probes.
+
+        Verdict per candidate:
+          TOKEN == our token  -> MATCH, return it.
+          TOKEN != our token  -> different valid token: positively not our
+                                 board. Rule out permanently.
+          AUTH_FAIL           -> wrong password. The freshly-programmed board
+                                 always carries the configured password, so
+                                 this is a finished, password-changed gateway.
+                                 We still allow a couple of strikes (cheap
+                                 insurance against a transient SSH race during
+                                 the board's own sshd startup) before ruling
+                                 it out.
+          NO_TOKEN / UNREACHABLE -> inconclusive: the board may be our target
+                                 still finishing first boot. Retry next pass.
+
+        Returns (ip, host) on a match, else None.
         Only called when self.program_id is set.
         """
         want = self.program_id
         if ruled_out is None:
             ruled_out = set()
-        for ip, host in boards:
-            if host.lower() in ruled_out:
-                continue  # already known to be a different board
-            tok = self._read_program_id(ip, user, pw)
-            if tok is None:
-                # No token readable - board may still be booting / SSH not up
-                # yet. Inconclusive: do NOT rule it out, retry next pass.
-                self._result(f"  {host} ({ip}): no program-id readable yet "
+        if auth_strikes is None:
+            auth_strikes = {}
+        AUTH_STRIKE_LIMIT = 2
+
+        to_probe = [(ip, host) for ip, host in candidates
+                    if ip not in ruled_out]
+        if not to_probe:
+            return None
+
+        # Probe candidates concurrently - on a small LAN this is a handful of
+        # hosts; serial SSH (8 s connect timeout each) would be needlessly
+        # slow when one board is mid-boot and times out.
+        results = {}   # ip -> (status, token)
+        threads = []
+
+        def probe(ip):
+            results[ip] = self._read_program_id(ip, user, pw)
+
+        for ip, _host in to_probe:
+            t = threading.Thread(target=probe, args=(ip,), daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+
+        match = None
+        for ip, host in to_probe:
+            status, token = results.get(ip, ("UNREACHABLE", None))
+            label = f"{host or ip} ({ip})"
+            if status == "TOKEN" and token == want:
+                self._result(f"  {label}: program-id MATCH.")
+                match = (ip, host)
+                # don't break - finish annotating, but a match is a match
+            elif status == "TOKEN":
+                ruled_out.add(ip)
+                self._result(f"  {label}: different program-id — ruled out.")
+            elif status == "AUTH_FAIL":
+                n = auth_strikes.get(ip, 0) + 1
+                auth_strikes[ip] = n
+                if n >= AUTH_STRIKE_LIMIT:
+                    ruled_out.add(ip)
+                    self._result(f"  {label}: SSH password rejected "
+                                  f"{n}x — finished gateway, ruled out.")
+                else:
+                    self._result(f"  {label}: SSH password rejected "
+                                  f"(strike {n}/{AUTH_STRIKE_LIMIT}).")
+            elif status == "NO_TOKEN":
+                self._result(f"  {label}: reachable, no program-id yet "
                               "(still booting?).")
-                continue
-            if tok == want:
-                self._result(f"  {host} ({ip}): program-id MATCH.")
-                return ip, host
-            # Valid token, but from a different run - this board can never be
-            # the target. Rule it out so we never SSH it again this verify.
-            ruled_out.add(host.lower())
-            self._result(f"  {host} ({ip}): program-id is from a different "
-                          f"run — ruled out.")
-        return None
+            else:  # UNREACHABLE
+                self._result(f"  {label}: not reachable yet (still booting?).")
+        return match
 
     def _select_verify_target(self, boards):
         """Fallback target selector, used when program-id matching did not
@@ -2424,45 +2566,64 @@ class App(tk.Tk):
             if have_token:
                 # Primary path: identify the board by the unique program-id
                 # token written during programming. Works even when
-                # re-programming a board already on the LAN.
+                # re-programming a board already on the LAN, and does NOT
+                # depend on mDNS - the ARP/ping-sweep finds every live host
+                # regardless of what it advertises.
                 #
                 # The board just programmed may still be running firstrun.sh
-                # when the operator clicks Verify, so this retries. Two
-                # things make the retry cheap:
-                #   - discovered boards ACCUMULATE across passes (a board
-                #     does not leave the LAN between retries), so we union
-                #     each pass into 'known' rather than re-discovering from
-                #     scratch;
-                #   - boards found to carry a DIFFERENT token are recorded
-                #     in 'ruled_out' and never SSH-probed again.
-                # So each retry only SSHes boards whose token is still
-                # unknown - in practice just the one still booting.
+                # when the operator clicks Verify (the common "program, walk
+                # away, come back, power-cycle, click Verify" workflow), so
+                # this retries with a live heartbeat. Two things keep retries
+                # cheap:
+                #   - candidates ACCUMULATE across passes (a host does not
+                #     leave the LAN between retries), keyed by IP;
+                #   - a host proven NOT to be our board (different token, or
+                #     SSH password rejected) goes into 'ruled_out' and is
+                #     never probed again.
+                # So each retry only SSH-probes hosts whose status is still
+                # unknown - in practice just the board still booting.
                 self._result("Identifying the programmed board by its "
-                              "program-id token…\n")
+                              "program-id token (mDNS + LAN sweep)…\n")
                 token_deadline = time.time() + 300
                 ip, host = None, None
-                known = {}          # hostname(lower) -> (ip, host)
-                ruled_out = set()   # hostnames carrying a different token
-                while time.time() < token_deadline:
+                known = {}           # ip -> (ip, host)  host may be ""
+                ruled_out = set()    # ips proven not to be our board
+                auth_strikes = {}    # ip -> consecutive AUTH_FAIL count
+
+                def sweep_progress(d, t):
                     self._set_verify_status(
-                        "Searching for the programmed board…", "#000")
-                    boards = self._collect_all_boards(
-                        template, deadline=time.time() + 60, snapshot=None)
-                    for b in boards:
-                        known[b[1].lower()] = b
-                    # Probe only boards whose token we don't already know.
-                    to_probe = [b for h, b in known.items()
-                                if h not in ruled_out]
+                        f"Scanning LAN for gateways… {d}/{t}", "#000")
+
+                while time.time() < token_deadline:
+                    # --- Source 1: mDNS browse (fast path when it works) ---
+                    self._set_verify_status(
+                        "Searching for the programmed board (mDNS)…", "#000")
+                    for b_ip, b_host in self._avahi_browse_workstations():
+                        if b_ip and ":" not in b_ip:
+                            known[b_ip] = (b_ip, b_host or "")
+                    # --- Source 2: ARP/ping-sweep (mDNS-independent) -------
+                    for s_ip in self._sweep_lan_ips(
+                            progress_cb=sweep_progress):
+                        known.setdefault(s_ip, (s_ip, ""))
+
+                    # Probe every candidate whose status we don't yet know.
+                    to_probe = [c for cip, c in known.items()
+                                if cip not in ruled_out]
                     if to_probe:
                         self._result(
-                            f"{len(known)} gateway(s) known; checking "
+                            f"{len(known)} host(s) on the LAN; probing "
                             f"{len(to_probe)} for this run's program-id…")
+                        self._set_verify_status(
+                            f"Checking {len(to_probe)} host(s) for the "
+                            "programmed board…", "#000")
                         match = self._match_by_program_id(
-                            to_probe, user, pw, ruled_out=ruled_out)
+                            to_probe, user, pw, ruled_out=ruled_out,
+                            auth_strikes=auth_strikes)
                         if match is not None:
                             ip, host = match
                             self._result(
-                                f"Confirmed by program-id: {host} at {ip}\n")
+                                f"Confirmed by program-id: "
+                                f"{host or ip} at {ip}\n")
                             break
                     remaining = int(token_deadline - time.time())
                     if remaining <= 0:
@@ -2569,6 +2730,29 @@ class App(tk.Tk):
                           "a moment and run Find and Verify again.")
             return False
         self._result(f"SSH OK (after {attempt} attempt(s)).\n")
+
+        # If discovery found the board purely by IP (ARP/ping-sweep, no
+        # hostname), we have no MAC for the Label tab yet. Read eth0's MAC
+        # directly over the SSH connection - this is the authoritative
+        # source anyway, more reliable than parsing it out of the hostname.
+        if not host or not getattr(self, "found_mac", ""):
+            try:
+                _in, _out, _err = client.exec_command(
+                    "cat /sys/class/net/eth0/address", timeout=10)
+                eth_mac = _out.read().decode(errors="replace").strip()
+                if eth_mac:
+                    try:
+                        self.found_mac = format_mac_colons(eth_mac)
+                    except ValueError:
+                        self.found_mac = eth_mac
+                    if not host:
+                        # Derive the CareBloom<MAC> name the board uses.
+                        host = "CareBloom" + re.sub(
+                            r"[^0-9A-Fa-f]", "", eth_mac).lower()
+                        self.found_host.set(host)
+                    self._result(f"Read eth0 MAC over SSH: {self.found_mac}")
+            except Exception as e:
+                self._result(f"(Could not read eth0 MAC over SSH: {e})")
 
         checks = [
             ("Identity",    "cat /etc/os-release | head -5"),
@@ -3496,4 +3680,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+
