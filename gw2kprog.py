@@ -853,6 +853,9 @@ class App(tk.Tk):
         self.verify_btn = ttk.Button(ctrl, text="Find and Verify",
                                      command=self._start_verify_thread)
         self.verify_btn.pack(side="left", padx=4, ipadx=20, ipady=6)
+        ttk.Button(ctrl, text="Enter MAC Manually",
+                   command=self._manual_verify_entry).pack(
+            side="right", padx=4, ipadx=10, ipady=6)
         ttk.Label(ctrl, text="Found at:").pack(side="left", padx=(20, 4))
         ttk.Entry(ctrl, textvariable=self.found_ip, width=18,
                   state="readonly").pack(side="left")
@@ -1973,10 +1976,102 @@ class App(tk.Tk):
         done.wait()
         return result.get("board")
 
-    def _verify_workflow(self):
+    def _ask_manual_target(self, reason=""):
+        """Show a modal asking the operator to enter the gateway's IP
+        address or hostname directly, bypassing network discovery. Used
+        both as the fallback when discovery fails and from the 'Enter MAC
+        Manually' button. Thread-safe: marshals onto the UI thread and
+        blocks. Returns an (ip, hostname) tuple, or None if cancelled.
+
+        The operator may type an IP, a hostname, or a MAC. A MAC (or bare
+        12 hex digits) is turned into the CareBloom<MAC> hostname."""
+        result = {}
+        done = threading.Event()
+
+        def show():
+            dlg = tk.Toplevel(self)
+            dlg.title("Enter gateway manually")
+            dlg.transient(self)
+            dlg.grab_set()
+            msg = ("Enter the gateway's IP address, hostname, or Ethernet "
+                   "MAC.\nUse this when the gateway can't be found "
+                   "automatically\n(for example on a network that blocks "
+                   "mDNS).")
+            if reason:
+                msg = reason + "\n\n" + msg
+            ttk.Label(dlg, padding=12, justify="left",
+                      text=msg).pack(anchor="w")
+            row = ttk.Frame(dlg, padding=(12, 0))
+            row.pack(fill="x")
+            ttk.Label(row, text="IP / hostname / MAC:").pack(side="left")
+            var = tk.StringVar()
+            ent = ttk.Entry(row, textvariable=var, width=30)
+            ent.pack(side="left", padx=6)
+            ent.focus_set()
+            hint = ttk.Label(
+                dlg, padding=(12, 2), foreground="#888",
+                text="e.g.  192.168.0.115   or   CareBloom88a29eceff84   "
+                     "or   88:a2:9e:ce:ff:84")
+            hint.pack(anchor="w")
+
+            def ok():
+                raw = var.get().strip()
+                if not raw:
+                    return
+                ip, host = "", ""
+                # Plain IPv4 address?
+                if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", raw):
+                    ip = raw
+                else:
+                    # MAC or 12 hex digits -> CareBloom<MAC> hostname.
+                    hexonly = re.sub(r"[^0-9A-Fa-f]", "", raw)
+                    if len(hexonly) == 12 and re.fullmatch(
+                            r"[0-9A-Fa-f:.\-]+", raw):
+                        host = "CareBloom" + hexonly.lower()
+                    else:
+                        # Treat as a hostname (strip any .local).
+                        host = raw.split(".")[0]
+                result["target"] = (ip, host)
+                done.set()
+                dlg.destroy()
+
+            def cancel():
+                done.set()
+                dlg.destroy()
+
+            btns = ttk.Frame(dlg, padding=12)
+            btns.pack(fill="x")
+            ttk.Button(btns, text="Verify this gateway",
+                       command=ok).pack(side="left", padx=4)
+            ttk.Button(btns, text="Cancel",
+                       command=cancel).pack(side="right", padx=4)
+            ent.bind("<Return>", lambda e: ok())
+            dlg.protocol("WM_DELETE_WINDOW", cancel)
+
+        self.after(0, show)
+        done.wait()
+        return result.get("target")
+
+    def _manual_verify_entry(self):
+        """Handler for the 'Enter MAC Manually' button. Asks for a target
+        and, if given, runs verification against it - skipping discovery."""
+        target = self._ask_manual_target()
+        if not target:
+            return
+        self._start_transcript(VERIFY_LOG, "GW2000 Verify (manual)")
+        self.verify_btn.configure(state="disabled")
+        self.verify_results.configure(state="normal")
+        self.verify_results.delete("1.0", "end")
+        self.verify_status.configure(text="Verifying entered gateway…",
+                                      foreground="#0a7")
+        threading.Thread(
+            target=lambda: self._verify_workflow(manual_target=target),
+            daemon=True).start()
+
+    def _verify_workflow(self, manual_target=None):
         ok = False
         try:
-            ok = self._do_verify()
+            ok = self._do_verify(manual_target=manual_target)
         except Exception as e:
             self._result(f"EXCEPTION: {e}")
         finally:
@@ -2001,7 +2096,54 @@ class App(tk.Tk):
                         foreground="#c00")
             self.after(0, finish)
 
-    def _do_verify(self):
+    def _select_verify_target(self, boards):
+        """Given the list of discovered (ip, hostname) gateways, decide which
+        one to verify. Returns (ip, host), or (None, None) if no board could
+        be chosen (caller then offers manual entry).
+
+        Uses the LAN snapshot taken at program time: the board just
+        programmed is the arrival that wasn't on the network before.
+        """
+        if not boards:
+            self._result("Could not find any gateway within 5 minutes.")
+            self._result("Check: BOOT jumper REMOVED, Ethernet connected, "
+                          "5V/3A USB-C supply powering the board.")
+            return None, None
+
+        snap = self.lan_snapshot
+        new_boards = None
+        if snap is not None:
+            new_boards = [b for b in boards if b[1].lower() not in snap]
+
+        if new_boards is not None and len(new_boards) == 1:
+            ip, host = new_boards[0]
+            self._result(f"Identified the newly-programmed gateway: "
+                          f"{host} at {ip}\n")
+            return ip, host
+        if new_boards is not None and len(new_boards) == 0 and snap:
+            self._result("The gateway just programmed is not on the network "
+                          "yet.")
+            self._result("Found only previously-known gateway(s): "
+                          + ", ".join(h for _, h in boards))
+            return None, None
+        if len(boards) == 1:
+            ip, host = boards[0]
+            self._result(f"One gateway found: {host} at {ip}\n")
+            return ip, host
+        # Multiple candidates - ask the operator to pick.
+        pick_list = new_boards if new_boards else boards
+        self._result(f"{len(pick_list)} candidate gateway(s) - asking which "
+                      "one to verify.")
+        self._set_verify_status(
+            "Multiple gateways found — select one to verify.", "#a60")
+        chosen = self._ask_pick_board(pick_list)
+        if not chosen:
+            return None, None
+        ip, host = chosen
+        self._result(f"Selected: {host} at {ip}\n")
+        return ip, host
+
+    def _do_verify(self, manual_target=None):
         template = (getattr(self, "expected_hostname_template", None)
                     or self.hostname.get())
         user = self.expected_user or self.username.get()
@@ -2012,98 +2154,83 @@ class App(tk.Tk):
                           "Run: sudo apt install python3-paramiko")
             return False
 
-        # Enforce a settle delay after programming. First boot runs
-        # firstrun.sh and then reboots, so the board isn't discoverable for
-        # ~90-120 s. If the operator clicked Find and Verify sooner, wait out
-        # the remainder here. If 2 min already elapsed, this is a no-op.
-        if self.program_finished_at is not None:
-            elapsed = time.time() - self.program_finished_at
-            remaining = POST_PROGRAM_SETTLE_SECS - elapsed
-            if remaining > 0:
-                self._result(
-                    f"Programming finished {int(elapsed)} s ago. The board "
-                    "is still completing first boot (firstrun.sh runs, then "
-                    "the board reboots once).")
-                self._result(
-                    f"Waiting {int(remaining)} s before discovery so the "
-                    "board has time to come up...")
-                while True:
-                    remaining = (POST_PROGRAM_SETTLE_SECS
-                                 - (time.time() - self.program_finished_at))
-                    if remaining <= 0:
-                        break
-                    mins, secs = divmod(int(remaining), 60)
-                    self._set_verify_status(
-                        f"Board still booting — discovery starts in "
-                        f"{mins}:{secs:02d}", "#a60")
-                    time.sleep(1)
-                self._result("Settle delay complete — starting discovery.\n")
-                self._set_verify_status("Searching for the board…", "#000")
+        # ---- Manual target path: skip discovery entirely ------------------
+        if manual_target is not None:
+            m_ip, m_host = manual_target
+            if not m_ip and m_host:
+                self._result(f"Manual entry: resolving {m_host}.local ...")
+                m_ip = self._resolve_hostname(m_host)
+                if not m_ip:
+                    self._result(f"Could not resolve {m_host}. Trying the "
+                                  "name directly for SSH.")
+            if m_ip:
+                self._result(f"Manual entry: verifying {m_host or m_ip} "
+                              f"at {m_ip}\n")
             else:
-                self._result(
-                    f"Programming finished {int(elapsed)} s ago "
-                    "(past the 2-min settle window) — starting discovery "
-                    "immediately.\n")
-
-        self._result(f"Hostname template: {template}")
-        self._result("Each gateway names itself CareBloom<eth0-MAC>, so we "
-                      "list every CareBloom gateway on the LAN…\n")
-        boards = self._collect_all_boards(template,
-                                          deadline=time.time() + 300,
-                                          snapshot=self.lan_snapshot)
-        if not boards:
-            self._result("Could not find any gateway within 5 minutes.")
-            self._result("Check: BOOT jumper REMOVED, Ethernet connected, "
-                          "5V/3A USB-C supply powering the board. "
-                          "Wait ~120 s after power-on.")
-            return False
-
-        # Identify which discovered board is the one just programmed.
-        # If a LAN snapshot was taken at program time, the new board is the
-        # arrival that wasn't on the network before. This is reliable even
-        # when other CareBloom gateways are already on the LAN.
-        snap = self.lan_snapshot
-        new_boards = None
-        if snap is not None:
-            new_boards = [b for b in boards if b[1].lower() not in snap]
-
-        if new_boards is not None and len(new_boards) == 1:
-            # Exactly one new arrival since programming - that's our board.
-            ip, host = new_boards[0]
-            self._result(f"Identified the newly-programmed gateway: "
-                          f"{host} at {ip}\n")
-        elif new_boards is not None and len(new_boards) == 0 and snap:
-            # Boards found, but none of them are new since programming -
-            # the board just programmed hasn't appeared on the network yet.
-            # Do NOT silently verify a pre-existing board.
-            self._result("The gateway just programmed is not on the network "
-                          "yet.")
-            self._result(f"Found only previously-known gateway(s): "
-                          + ", ".join(h for _, h in boards))
-            self._result("Wait a bit longer for it to finish booting, then "
-                          "click Find and Verify again.")
-            self._set_verify_status(
-                "Programmed gateway not on network yet — wait and retry.",
-                "#c00")
-            return False
-        elif len(boards) == 1:
-            # No usable snapshot, single board - use it.
-            ip, host = boards[0]
-            self._result(f"One gateway found: {host} at {ip}\n")
+                self._result(f"Manual entry: verifying {m_host} "
+                              "(by hostname)\n")
+            ip = m_ip or m_host
+            host = m_host or ""
         else:
-            # No snapshot, or multiple new arrivals - ask the operator.
-            pick_list = new_boards if (new_boards) else boards
-            self._result(f"{len(pick_list)} candidate gateway(s) - asking "
-                          "which one to verify.")
-            self._set_verify_status(
-                "Multiple gateways found — select one to verify.", "#a60")
-            chosen = self._ask_pick_board(pick_list)
-            if not chosen:
-                self._result("Verification cancelled - no gateway selected.")
-                return False
-            ip, host = chosen
-            self._result(f"Selected: {host} at {ip}\n")
-            self._set_verify_status("Verifying selected gateway…", "#000")
+            # Enforce a settle delay after programming. First boot runs
+            # firstrun.sh then reboots, so the board isn't discoverable for
+            # ~90-120 s. If the operator clicked Find and Verify sooner,
+            # wait out the remainder. If 2 min already elapsed, no-op.
+            if self.program_finished_at is not None:
+                elapsed = time.time() - self.program_finished_at
+                remaining = POST_PROGRAM_SETTLE_SECS - elapsed
+                if remaining > 0:
+                    self._result(
+                        f"Programming finished {int(elapsed)} s ago. The "
+                        "board is still completing first boot (firstrun.sh "
+                        "runs, then the board reboots once).")
+                    self._result(
+                        f"Waiting {int(remaining)} s before discovery so "
+                        "the board has time to come up...")
+                    while True:
+                        remaining = (POST_PROGRAM_SETTLE_SECS
+                                     - (time.time()
+                                        - self.program_finished_at))
+                        if remaining <= 0:
+                            break
+                        mins, secs = divmod(int(remaining), 60)
+                        self._set_verify_status(
+                            f"Board still booting — discovery starts in "
+                            f"{mins}:{secs:02d}", "#a60")
+                        time.sleep(1)
+                    self._result("Settle delay complete — starting "
+                                  "discovery.\n")
+                    self._set_verify_status("Searching for the board…",
+                                            "#000")
+                else:
+                    self._result(
+                        f"Programming finished {int(elapsed)} s ago "
+                        "(past the 2-min settle window) — starting "
+                        "discovery immediately.\n")
+
+            self._result(f"Hostname template: {template}")
+            self._result("Each gateway names itself CareBloom<eth0-MAC>, so "
+                          "we list every CareBloom gateway on the LAN…\n")
+            boards = self._collect_all_boards(
+                template, deadline=time.time() + 300,
+                snapshot=self.lan_snapshot)
+
+            ip, host = self._select_verify_target(boards)
+            if ip is None:
+                # Discovery failed or operator declined - offer manual entry.
+                fb = self._ask_manual_target(
+                    reason="The gateway could not be found automatically.")
+                if not fb:
+                    self._result("Verification cancelled.")
+                    return False
+                m_ip, m_host = fb
+                if not m_ip and m_host:
+                    self._result(f"Manual entry: resolving "
+                                  f"{m_host}.local ...")
+                    m_ip = self._resolve_hostname(m_host)
+                ip = m_ip or m_host
+                host = m_host or ""
+                self._result(f"Manual entry: verifying {host or ip}\n")
 
         # Record for other tabs (Label Generation 'Use verified board's MAC').
         self.found_ip.set(ip)
@@ -2248,6 +2375,35 @@ class App(tk.Tk):
         h = re.sub(r"[^A-Za-z0-9-]", "", h)[:63].strip("-")
         return h
 
+    def _resolve_hostname(self, hostname):
+        """Resolve a short hostname to an IPv4 address via mDNS (.local) then
+        plain DNS. Returns the IP string, or '' if it can't be resolved.
+
+        This is the fallback for hosts that avahi-browse DISCOVERS (a '+'
+        record) but whose service-resolve ('=' record) times out - common
+        when a board is still early in boot: it announces its service but
+        its mDNS responder isn't fully answering yet. Resolving the
+        '<hostname>.local' name directly succeeds in that window even when
+        the service-resolve does not."""
+        fqdn = hostname if "." in hostname else hostname + ".local"
+        if which("avahi-resolve"):
+            try:
+                out = subprocess.check_output(
+                    ["avahi-resolve", "-4", "-n", fqdn],
+                    text=True, stderr=subprocess.DEVNULL, timeout=8)
+                parts = out.split()
+                if len(parts) >= 2 and ":" not in parts[1]:
+                    return parts[1]
+            except Exception:
+                pass
+        try:
+            info = socket.getaddrinfo(fqdn, None, socket.AF_INET)
+            if info:
+                return info[0][4][0]
+        except Exception:
+            pass
+        return ""
+
     def _avahi_browse_workstations(self):
         """Browse mDNS for hosts and return a list of (ip, hostname) tuples
         (IPv4 only, hostname is the short name).
@@ -2259,6 +2415,15 @@ class App(tk.Tk):
         (e.g. a Brother printer's _privet/_ipp services), dragging the whole
         call past its timeout and making it return nothing. Restricting to
         _workstation._tcp keeps it fast and reliable.
+
+        Handles BOTH record types from avahi-browse:
+          '=' resolved records - give the IP directly.
+          '+' found-but-unresolved records - happen when a board is still
+              booting (it announces its service but its mDNS responder
+              isn't answering address queries yet). For these we extract
+              the hostname from the service name and resolve it directly.
+              Without this, a freshly-booted board is invisible until its
+              service-resolve stops timing out.
 
         Returns [] on any failure (avahi missing, timeout, etc.)."""
         if not which("avahi-browse"):
@@ -2272,23 +2437,45 @@ class App(tk.Tk):
             return []
         except Exception:
             return []
-        results = []
+
+        by_host = {}        # short hostname(lower) -> ip
+        unresolved = set()  # short hostnames seen only as '+' records
+
         for line in out.splitlines():
-            # Resolved records start with '=' ; ';'-separated fields:
-            # =;iface;proto;name;type;domain;host;ip;port;txt
-            if not line.startswith("="):
-                continue
             f = line.split(";")
-            if len(f) < 8:
+            if line.startswith("="):
+                # =;iface;proto;name;type;domain;host;ip;port;txt
+                if len(f) < 8 or f[2] != "IPv4":
+                    continue
+                host = f[6].split(".")[0]
+                ip = f[7]
+                if host and ip and ":" not in ip:
+                    by_host[host.lower()] = ip
+            elif line.startswith("+"):
+                # +;iface;proto;name;type;domain
+                # The service name (field 3) is '<hostname>\032[MAC]' on
+                # Raspberry Pi OS - the leading token is the hostname.
+                if len(f) < 4:
+                    continue
+                svc = f[3]
+                # Hostname = text up to the first escaped space (\032) or
+                # literal space; strip any avahi backslash-escapes.
+                name = re.split(r"\\032| ", svc)[0]
+                name = re.sub(r"\\(\d{3})",
+                               lambda m: chr(int(m.group(1))), name)
+                name = name.split(".")[0].strip()
+                if name:
+                    unresolved.add(name.lower())
+
+        # For any host seen only as '+' (no '=' record), resolve it directly.
+        for name in unresolved:
+            if name in by_host:
                 continue
-            proto = f[2]
-            if proto != "IPv4":
-                continue
-            host = f[6].split(".")[0]
-            ip = f[7]
-            if host and ip and ":" not in ip:
-                results.append((ip, host))
-        return results
+            ip = self._resolve_hostname(name)
+            if ip:
+                by_host[name] = ip
+
+        return [(ip, host) for host, ip in by_host.items()]
 
     def _snapshot_lan_boards(self, hostname_template):
         """Return the set of CareBloom gateway hostnames (lowercased) visible
