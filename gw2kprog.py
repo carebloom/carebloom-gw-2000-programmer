@@ -2358,6 +2358,52 @@ class App(tk.Tk):
                 live.add(m.group(1))
         return live
 
+    def _reverse_resolve(self, ip):
+        """Best-effort reverse lookup of an IP to a short hostname. Returns
+        the lowercase short name, or '' if it can't be determined quickly.
+        Used only to classify sweep results - never blocks long."""
+        if which("avahi-resolve"):
+            try:
+                out = subprocess.check_output(
+                    ["avahi-resolve", "-a", ip],
+                    text=True, stderr=subprocess.DEVNULL, timeout=4)
+                parts = out.split()
+                if len(parts) >= 2:
+                    return parts[1].split(".")[0].strip().lower()
+            except Exception:
+                pass
+        return ""
+
+    def _is_gateway_candidate(self, ip, host):
+        """Decide whether a discovered host should be SSH-probed for the
+        program-id token. We probe a host only if it could plausibly be a
+        GW2000 gateway:
+
+          - hostname starts with 'CareBloom'  -> a programmed gateway;
+          - hostname is 'raspberrypi'         -> a board still running
+                                                 firstrun.sh (the bare image
+                                                 default name, not renamed
+                                                 yet);
+          - no resolvable hostname at all     -> unknown; could be a board
+                                                 mid-boot, so we still probe.
+
+        Anything that resolves to some OTHER name (phones, laptops,
+        printers, the programmer host itself) is NOT a gateway and is
+        excluded - so the tool never SSH-login-attempts unrelated devices on
+        the LAN, and the retry budget is spent waiting for the actual board
+        to finish first boot."""
+        name = (host or "").lower()
+        if not name:
+            name = self._reverse_resolve(ip)
+        if not name:
+            # Genuinely no name - could be a booting board. Probe it.
+            return True, ""
+        if name.startswith("carebloom"):
+            return True, name
+        if name == "raspberrypi":
+            return True, name
+        return False, name
+
     def _match_by_program_id(self, candidates, user, pw,
                              ruled_out=None, auth_strikes=None):
         """Given candidate (ip, host) boards, SSH each in parallel and look
@@ -2374,13 +2420,18 @@ class App(tk.Tk):
           TOKEN == our token  -> MATCH, return it.
           TOKEN != our token  -> different valid token: positively not our
                                  board. Rule out permanently.
-          AUTH_FAIL           -> wrong password. The freshly-programmed board
-                                 always carries the configured password, so
-                                 this is a finished, password-changed gateway.
-                                 We still allow a couple of strikes (cheap
-                                 insurance against a transient SSH race during
-                                 the board's own sshd startup) before ruling
-                                 it out.
+          AUTH_FAIL           -> SSH password rejected. What this means
+                                 depends on the host's name:
+                                  - a 'CareBloom*'-named host is a FINISHED
+                                    gateway whose password was changed late
+                                    in test -> rule it out (after a couple
+                                    of strikes, as cheap insurance against a
+                                    transient SSH race).
+                                  - a 'raspberrypi'/unnamed host is very
+                                    likely a board still running firstrun.sh
+                                    (the bare image has no configured
+                                    password yet) -> do NOT rule it out;
+                                    keep retrying until first boot finishes.
           NO_TOKEN / UNREACHABLE -> inconclusive: the board may be our target
                                  still finishing first boot. Retry next pass.
 
@@ -2419,6 +2470,9 @@ class App(tk.Tk):
         for ip, host in to_probe:
             status, token = results.get(ip, ("UNREACHABLE", None))
             label = f"{host or ip} ({ip})"
+            # A host already wearing a CareBloom name is a FINISHED gateway.
+            # A 'raspberrypi'/unnamed host may be a board still booting.
+            looks_finished = host.lower().startswith("carebloom")
             if status == "TOKEN" and token == want:
                 self._result(f"  {label}: program-id MATCH.")
                 match = (ip, host)
@@ -2427,15 +2481,22 @@ class App(tk.Tk):
                 ruled_out.add(ip)
                 self._result(f"  {label}: different program-id — ruled out.")
             elif status == "AUTH_FAIL":
-                n = auth_strikes.get(ip, 0) + 1
-                auth_strikes[ip] = n
-                if n >= AUTH_STRIKE_LIMIT:
-                    ruled_out.add(ip)
-                    self._result(f"  {label}: SSH password rejected "
-                                  f"{n}x — finished gateway, ruled out.")
+                if not looks_finished:
+                    # Unnamed / 'raspberrypi' host: a board still running
+                    # firstrun.sh has no configured password yet. Keep
+                    # retrying - do NOT rule it out.
+                    self._result(f"  {label}: SSH password not accepted yet "
+                                  "(board still completing first boot?).")
                 else:
-                    self._result(f"  {label}: SSH password rejected "
-                                  f"(strike {n}/{AUTH_STRIKE_LIMIT}).")
+                    n = auth_strikes.get(ip, 0) + 1
+                    auth_strikes[ip] = n
+                    if n >= AUTH_STRIKE_LIMIT:
+                        ruled_out.add(ip)
+                        self._result(f"  {label}: SSH password rejected "
+                                      f"{n}x — finished gateway, ruled out.")
+                    else:
+                        self._result(f"  {label}: SSH password rejected "
+                                      f"(strike {n}/{AUTH_STRIKE_LIMIT}).")
             elif status == "NO_TOKEN":
                 self._result(f"  {label}: reachable, no program-id yet "
                               "(still booting?).")
@@ -2587,6 +2648,7 @@ class App(tk.Tk):
                 token_deadline = time.time() + 300
                 ip, host = None, None
                 known = {}           # ip -> (ip, host)  host may be ""
+                gateway_hosts = {}   # ip -> (ip, host)  classified gateways
                 ruled_out = set()    # ips proven not to be our board
                 auth_strikes = {}    # ip -> consecutive AUTH_FAIL count
 
@@ -2600,24 +2662,48 @@ class App(tk.Tk):
                         "Searching for the programmed board (mDNS)…", "#000")
                     for b_ip, b_host in self._avahi_browse_workstations():
                         if b_ip and ":" not in b_ip:
-                            known[b_ip] = (b_ip, b_host or "")
+                            # mDNS gave a name - keep the best name we have.
+                            prev = known.get(b_ip, (b_ip, ""))
+                            known[b_ip] = (b_ip, b_host or prev[1])
                     # --- Source 2: ARP/ping-sweep (mDNS-independent) -------
                     for s_ip in self._sweep_lan_ips(
                             progress_cb=sweep_progress):
                         known.setdefault(s_ip, (s_ip, ""))
 
-                    # Probe every candidate whose status we don't yet know.
-                    to_probe = [c for cip, c in known.items()
-                                if cip not in ruled_out]
-                    if to_probe:
+                    # Filter the LAN down to plausible gateways before
+                    # probing. Without this, a busy LAN (phones, laptops,
+                    # printers) would have every host SSH-probed, which is
+                    # slow, noisy, and burns the retry budget that should be
+                    # spent waiting for the real board to finish first boot.
+                    candidates = []   # (ip, host) gateway candidates
+                    excluded = 0
+                    for cip, (c_ip, c_host) in known.items():
+                        if cip in ruled_out:
+                            continue
+                        is_cand, resolved = self._is_gateway_candidate(
+                            c_ip, c_host)
+                        if is_cand:
+                            # Carry the resolved name forward for nicer logs
+                            # and so _match_by_program_id's AUTH_FAIL logic
+                            # can tell a finished gateway from a booting one.
+                            cand = (c_ip, resolved or c_host)
+                            candidates.append(cand)
+                            gateway_hosts[c_ip] = cand
+                        else:
+                            ruled_out.add(cip)   # not a gateway - never probe
+                            excluded += 1
+
+                    if candidates:
                         self._result(
-                            f"{len(known)} host(s) on the LAN; probing "
-                            f"{len(to_probe)} for this run's program-id…")
+                            f"{len(known)} host(s) on the LAN; "
+                            f"{len(candidates)} look like gateways, "
+                            f"{excluded} excluded — probing for this run's "
+                            "program-id…")
                         self._set_verify_status(
-                            f"Checking {len(to_probe)} host(s) for the "
+                            f"Checking {len(candidates)} gateway(s) for the "
                             "programmed board…", "#000")
                         match = self._match_by_program_id(
-                            to_probe, user, pw, ruled_out=ruled_out,
+                            candidates, user, pw, ruled_out=ruled_out,
                             auth_strikes=auth_strikes)
                         if match is not None:
                             ip, host = match
@@ -2639,11 +2725,14 @@ class App(tk.Tk):
 
                 if ip is None:
                     # Token never matched within the deadline. Fall back to
-                    # the snapshot diff / operator pick on whatever is known.
+                    # an operator pick - but only over hosts that looked like
+                    # gateways, never the whole LAN.
                     self._result("Could not confirm the board by program-id. "
                                   "Falling back to manual selection.\n")
-                    ip, host = self._select_verify_target(
-                        list(known.values()))
+                    pick_from = [g for gip, g in gateway_hosts.items()
+                                 if gip not in ruled_out] \
+                        or list(gateway_hosts.values())
+                    ip, host = self._select_verify_target(pick_from)
             else:
                 # No token this session (Verify run without a prior Program).
                 # Use the original snapshot-diff discovery + Option C pick.
