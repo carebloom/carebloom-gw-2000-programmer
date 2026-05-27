@@ -608,6 +608,10 @@ class App(tk.Tk):
         # back to the LAN-snapshot diff and, ultimately, an operator pick).
         self.program_id = None
 
+        # Wall-clock time token discovery began on the current Verify run.
+        # Used only to log how long discovery took (boot-to-ready insight).
+        self._discovery_start = None
+
         # Set of CareBloom gateway hostnames already on the LAN at the moment
         # programming started. Verify diffs the current LAN against this to
         # identify the board that was JUST programmed (the new arrival),
@@ -2645,6 +2649,11 @@ class App(tk.Tk):
                 # unknown - in practice just the board still booting.
                 self._result("Identifying the programmed board by its "
                               "program-id token (mDNS + LAN sweep)…\n")
+                # Wall-clock at which token discovery began - used to log how
+                # long discovery took once the board is confirmed (a real
+                # measurement of how far into first boot the board became
+                # verifiable, vs. guessing a settle time).
+                self._discovery_start = time.time()
                 token_deadline = time.time() + 300
                 ip, host = None, None
                 known = {}           # ip -> (ip, host)  host may be ""
@@ -2819,6 +2828,35 @@ class App(tk.Tk):
                           "a moment and run Find and Verify again.")
             return False
         self._result(f"SSH OK (after {attempt} attempt(s)).\n")
+
+        # --- Boot-to-ready measurement --------------------------------------
+        # Log how long it actually took for the board to become verifiable,
+        # so first-boot timing is based on real data rather than a guessed
+        # settle delay. Two numbers, both measured (neither assumed):
+        #   - discovery elapsed: wall-clock from when token discovery started
+        #     to now (the board confirmed). Reflects how long the operator's
+        #     Find-and-Verify spent waiting for the board to come online.
+        #   - board uptime at confirmation: seconds since the board's current
+        #     boot, read from /proc/uptime. Note this is the CURRENT boot -
+        #     first boot includes a firstrun.sh reboot, so this measures time
+        #     since that reboot, not the whole power-on-to-ready cycle.
+        try:
+            disc = getattr(self, "_discovery_start", None)
+            if disc:
+                el = int(time.time() - disc)
+                self._result(f"=== Boot-to-ready ===")
+                self._result(f"discovery elapsed: {el // 60}m {el % 60}s "
+                              f"(time spent waiting for the board to appear)")
+            _in, _out, _err = client.exec_command(
+                "cat /proc/uptime", timeout=10)
+            up_raw = _out.read().decode(errors="replace").split()
+            if up_raw:
+                up = int(float(up_raw[0]))
+                self._result(f"board uptime at confirmation: "
+                              f"{up // 60}m {up % 60}s (since current boot; "
+                              "first boot also includes an earlier reboot)")
+        except Exception as e:
+            self._result(f"(boot-to-ready measurement unavailable: {e})")
 
         # If discovery found the board purely by IP (ARP/ping-sweep, no
         # hostname), we have no MAC for the Label tab yet. Read eth0's MAC
