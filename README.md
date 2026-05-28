@@ -28,7 +28,7 @@ gateway-firmware/      Created by setup_host.sh. Drop the Care Bloom
                        App Installation tab auto-picks the newest archive.
 ```
 
-The companion **carebloom-gateway-gw-2000** repo (not part of this repo) contains `setupSystemLocal.sh`, `avahi-daemon.conf`, the `CARE001` payload, and the Care Bloom application binaries. See "Gateway-firmware coordination" below.
+The companion [**carebloom-gateway-gw-2000**](https://github.com/carebloom/carebloom-gateway-gw-2000) repo (not part of this repo) contains `setupSystemLocal.sh`, `avahi-daemon.conf`, the `CARE001` payload, and the Care Bloom application binaries. See "Gateway-firmware coordination" below.
 
 ## Host requirements
 
