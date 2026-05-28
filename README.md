@@ -1,6 +1,6 @@
 # Care Bloom GW-2000 Programmer
 
-The GW-2000 programmer is a Linux workstation used in production to load the operating system, and Care Bloom gateway application, on the Care Bloom GW-2000 gateway. The initial deployment of the programmer leveraged a Raspberry Pi 5 as the host computer; host name `gw2kprog`.  
+The GW-2000 programmer is a Linux workstation used in production to load the operating system, and Care Bloom gateway application, on the Care Bloom GW-2000 gateway. The GW-2000 is comprised of a Raspberry Pi CM4 mounted to a Waveshare CM4-IO-BASE-C board. The initial deployment of the programmer leveraged a Raspberry Pi 5 as the host computer; host name `gw2kprog`.  
 
 The GW-2000 programmer automates a 5 step workflow as much as possible dedicating a GUI tab to each step. The workflow is as follows:
 
@@ -33,8 +33,8 @@ The companion **carebloom-gateway-gw-2000** repo (not part of this repo) contain
 ## Host requirements
 
 - Raspberry Pi 5, Pi 4, or a CM4 on a Pi-4-form-factor adapter, running Raspberry Pi OS **Bookworm** or **Trixie** (desktop).
-- USB-A from the host to the CM4-IO-Base-C's USB-C port for `rpiboot` (powers the CM4 *and* carries the mass-storage link).
-- Ethernet from the host and from every gateway under test to the same LAN (any IP scheme works; the tool sweeps the host's `/24`).
+- USB-A from the host to the CM4-IO-BASE-C's USB-C port for `rpiboot` (powers the CM4 *and* carries the mass-storage link).
+- Host Ethernet connected to same LAN as every gateway under test (any IP scheme works; the tool sweeps the host's `/24`).
 - For the Label Generation tab: a Zebra ZD410 thermal printer on one of the host USB ports (enumerates as `/dev/usb/lp0`).
 - A **USB-C power/data splitter** is strongly recommended in production —see "Hardware notes" below. Programming a CM4 over a single USB-A→USB-C cable from the host is power-marginal and will eventually fail.
 
