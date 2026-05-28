@@ -62,7 +62,7 @@ When it finishes, **log out and back in** (or reboot) so the new `plugdev`/`lp` 
 
 ### Token-based identification
 
-The Verify tab does **not** rely on hostname alone to identify the programmed board. At the start of each Program run, a unique random toke (`secrets.token_hex(8)`) is generated; the flasher writes it onto the boot partition; `firstrun.sh` copies it to `/etc/gw2k_program_id` on the booted system. Verify discovers candidate IPs via mDNS *and* a concurrent ARP/ping-sweep (so a board that isn't advertising mDNS yet still gets found), then SSHes each candidate and reads the token. The board carrying *this* run's token is the target — works even when re-programming a board that's already on the LAN, and works whether or not mDNS is functioning on the network.
+The Verify tab does **not** rely on hostname alone to identify the programmed board. At the start of each Program run, a unique random token(`secrets.token_hex(8)`) is generated; the flasher writes it onto the boot partition; `firstrun.sh` copies it to `/etc/gw2k_program_id` on the booted system. Verify discovers candidate IPs via mDNS *and* a concurrent ARP/ping-sweep (so a board that isn't advertising mDNS yet still gets found), then SSHes each candidate and reads the token. The board carrying *this* run's token is the target — works even when re-programming a board that's already on the LAN, and works whether or not mDNS is functioning on the network.
 
 Candidates are filtered to plausible gateways (hostname `CareBloom*`, `raspberrypi`, or unnamed) before any SSH probe, so the tool never login-attempts unrelated devices on the LAN.
 
