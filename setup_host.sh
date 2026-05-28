@@ -124,6 +124,15 @@ sudo tee /etc/udev/rules.d/99-rpiboot.rules > /dev/null <<'EOF'
 SUBSYSTEM=="usb", ATTRS{idVendor}=="0a5c", ATTRS{idProduct}=="2711", MODE="0660", GROUP="plugdev", TAG+="uaccess"
 SUBSYSTEM=="usb", ATTRS{idVendor}=="0a5c", ATTRS{idProduct}=="2764", MODE="0660", GROUP="plugdev", TAG+="uaccess"
 SUBSYSTEM=="usb", ATTRS{idVendor}=="0a5c", ATTRS{idProduct}=="2712", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# Once rpiboot loads the mass-storage gadget, the CM4 re-enumerates with
+# product ID 0104 ("Raspberry Pi multi-function USB device") and presents its
+# eMMC as a block device. The desktop's automounter (udisks2) sees a "new
+# removable disk" and pops up the 'What do you want to do with this disk?'
+# dialog. The flasher does NOT use udisks2 - it operates the device directly
+# via dd/mount - so we tell udisks2 to ignore this specific device. Other
+# USB drives are unaffected.
+SUBSYSTEM=="block", ATTRS{idVendor}=="0a5c", ATTRS{idProduct}=="0104", ENV{UDISKS_IGNORE}="1", ENV{UDISKS_AUTO}="0"
 EOF
 sudo udevadm control --reload-rules
 sudo udevadm trigger
