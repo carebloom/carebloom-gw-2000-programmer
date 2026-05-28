@@ -1,27 +1,16 @@
-# Care Bloom GW2000 Programmer
+# Care Bloom GW-2000 Programmer
 
-Production / factory tool for programming, verifying, and labeling Care Bloom
-GW2000 gateways at the flash station.
+The GW-2000 programmer is a Linux workstation used in production to load the operating system, and Care Bloom gateway application, on the Care Bloom GW-2000 gateway. The initial deployment of the programmer leveraged a Raspberry Pi 5 as the host computer; host name `gw2kprog`.  
 
-The GW2000 gateway is a Raspberry Pi **CM4** mounted on a Waveshare
-**CM4-IO-Base-C** board. This tool runs on a host Raspberry Pi (a **Pi 5** is
-the reference host, though a Pi 4 or a CM4-on-Pi4-adapter also works) and
-provides a five-step GUI workflow:
+The GW-2000 programmer automates a 5 step workflow as much as possible dedicating a GUI tab to each step. The workflow is as follows:
 
 1. **Configure** — set OS image, hostname template, credentials, Wi-Fi.
-2. **Program** — write the OS image to the CM4's eMMC via `rpiboot`, then
-   stage a `firstrun.sh` that sets the hostname, user, password, SSH, and
-   mDNS advertisement on first boot.
-3. **Verify** — discover the freshly-programmed board on the LAN, SSH in,
-   and run health checks (identity, kernel, hostname, network, AP status).
-4. **App Installation** — copy and run the Care Bloom application firmware
-   tarball over SSH (the gateway-firmware payload, including
-   `setupSystemLocal.sh` and the `CARE001` tree, lives in a separate repo).
-5. **Label Generation** — print a QR / serial label to a Zebra ZD410
-   thermal printer at `/dev/usb/lp0`.
+2. **Program** — write the OS image to the CM4's eMMC via `rpiboot`, then stage a `firstrun.sh` that sets the hostname, user, password, SSH, and mDNS advertisement on first boot.
+3. **Verify** — discover the freshly-programmed board on the LAN, SSH in, and run health checks (identity, kernel, hostname, network, AP status).
+4. **App Installation** — copy and run the Care Bloom application firmware tarball over SSH (the gateway-firmware payload, including `setupSystemLocal.sh` and the `CARE001` tree, lives in a separate repo).
+5. **Label Generation** — print a QR / serial label to a Zebra ZD410 thermal printer at `/dev/usb/lp0`.
 
-A program log is appended to `~/gw2k_program_log.csv` and full per-tab
-transcripts are written to `~/gw2k-programmer-logs/`.
+A program log is appended to `~/gw2k_program_log.csv` and full per-tab transcripts are written to `~/gw2k-programmer-logs/`.
 
 ## Repository layout
 
@@ -70,7 +59,7 @@ bash setup_host.sh
 
 When it finishes, **log out and back in** (or reboot) so the new
 `plugdev`/`lp` group membership and the sudoers/udev rules take effect.
-A "GW2000 Programmer" icon appears on the desktop.
+A "GW-2000 Programmer" icon appears on the desktop.
 
 `setup_host.sh` is safe to re-run; it converges on the configured state
 without duplicating anything. Re-run it after pulling repo updates that
@@ -85,7 +74,7 @@ change the rules or the launcher.
    Installation step.
 2. **Program**: set the CM4-IO-Base-C **BOOT switch to ON**, connect the
    USB-C cable from the host (or splitter) to the IO-board's USB-C port,
-   and click **Program GW2000**. The Steps panel ticks through Detect →
+   and click **Program GW-2000**. The Steps panel ticks through Detect →
    Identify eMMC → Unmount → Program image (`dd`) → Re-attach for config
    → Write first-boot config → Sync and eject. A post-`dd` size check
    confirms the eMMC didn't drop off the bus mid-write; if it did, Program
