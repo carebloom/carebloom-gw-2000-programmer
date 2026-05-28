@@ -1595,6 +1595,28 @@ class App(tk.Tk):
         self._set_step(3, "running")
         img = self.image_path.get()
         low = img.lower()
+
+        # Capture the eMMC's size BEFORE dd, so we can confirm it's still
+        # the same size AFTER. A USB disconnect mid-write (we have seen this
+        # caused by inadequate CM4 power during programming) makes the
+        # kernel drop the device's capacity to 0 - dd may still return rc=0
+        # if the disconnect happened after the last write, leaving a half-
+        # written eMMC that would silently fail to boot. Catching the size
+        # mismatch turns that failure mode into a clean Program FAIL.
+        def _block_size_bytes(dev):
+            """Return /sys/block/<name>/size * 512, or 0 if unreadable."""
+            try:
+                name = os.path.basename(dev)
+                with open(f"/sys/block/{name}/size") as f:
+                    return int(f.read().strip()) * 512
+            except Exception:
+                return 0
+
+        pre_size = _block_size_bytes(node)
+        if pre_size:
+            self.log(f"eMMC size before dd: {pre_size} bytes "
+                     f"({pre_size / (1024**3):.2f} GiB)")
+
         # Use bs=4M + status=progress (GNU dd). Operator sees throughput in the log.
         if low.endswith((".img.xz", ".xz")):
             pipeline = (f"xz -dc {shlex.quote(img)} | "
@@ -1614,6 +1636,36 @@ class App(tk.Tk):
             self.log("dd failed.")
             self._set_step(3, "fail")
             return False
+
+        # Post-dd integrity check: the eMMC must still be present at the
+        # SAME size we saw before. A drop to 0 (or substantially smaller)
+        # means the USB mass-storage link dropped mid-write - the eMMC was
+        # disconnected, and whatever dd reported, the image on the eMMC is
+        # not complete. Root cause for this on our line was inadequate CM4
+        # power during programming (single USB-A->C from the host could not
+        # sustain it under load); a powered splitter resolved it. The check
+        # stays here so any future regression (cable, connector, supply)
+        # surfaces immediately as a clean Program FAIL instead of producing
+        # a board that boots a corrupt image.
+        post_size = _block_size_bytes(node)
+        if pre_size and post_size != pre_size:
+            self.log(f"eMMC size after dd: {post_size} bytes "
+                     f"({post_size / (1024**3):.2f} GiB) — "
+                     f"EXPECTED {pre_size} bytes.")
+            if post_size == 0:
+                self.log("FAIL: eMMC dropped off the USB bus during "
+                         "programming. The image on the board is INCOMPLETE. "
+                         "Likely cause: CM4 under-powered during dd (use a "
+                         "real 5V/3A supply via a USB power/data splitter), "
+                         "or a marginal USB-C cable / connector.")
+            else:
+                self.log("FAIL: eMMC size changed during programming — the "
+                         "image on the board may be corrupt.")
+            self._set_step(3, "fail")
+            return False
+        if pre_size:
+            self.log(f"eMMC size after dd: {post_size} bytes — OK, unchanged.")
+
         run_stream(["sync"], self.log)
         self._set_step(3, "ok")
 
