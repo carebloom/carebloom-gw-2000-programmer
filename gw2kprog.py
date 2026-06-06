@@ -703,22 +703,22 @@ class App(tk.Tk):
         self.program_tab = ttk.Frame(nb)
         self.verify_tab = ttk.Frame(nb)
         self.install_tab = ttk.Frame(nb)
-        self.password_tab = ttk.Frame(nb)
         self.label_tab = ttk.Frame(nb)
+        self.password_tab = ttk.Frame(nb)
         nb.add(self.cfg_tab, text="1. Configure")
         nb.add(self.program_tab, text="2. Program")
         nb.add(self.verify_tab, text="3. Verify")
         nb.add(self.install_tab, text="4. App Installation")
-        nb.add(self.password_tab, text="5. Password Modification")
-        nb.add(self.label_tab, text="6. Label Generation")
+        nb.add(self.label_tab, text="5. Label Generation")
+        nb.add(self.password_tab, text="6. Passwords")
         self.notebook = nb
 
         self._build_cfg_tab(self.cfg_tab)
         self._build_program_tab(self.program_tab)
         self._build_verify_tab(self.verify_tab)
         self._build_install_tab(self.install_tab)
-        self._build_password_tab(self.password_tab)
         self._build_label_tab(self.label_tab)
+        self._build_password_tab(self.password_tab)
 
     def _row(self, parent, r, label, var, browse=None, show=None, hint=""):
         ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", padx=6, pady=4)
@@ -1586,9 +1586,10 @@ class App(tk.Tk):
             messagebox.showerror("paramiko missing",
                                   "paramiko is required for Test.")
             return
-        if not self._pw_validate_for_ssh():
-            return
-        # Don't truncate the transcript here - keep Generate's log visible.
+        # Test does not require the Root/WCP password fields to be filled
+        # (it tests the CURRENT fields, which are checked inside _pw_do_test
+        # itself). Don't gate on the full _pw_validate_for_ssh, which would
+        # block Test on a fresh board where Generate hasn't been clicked.
         self.pw_test_btn.configure(state="disabled")
         self.pw_write_btn.configure(state="disabled")
         self._pw_set_status("Testing passwords…", "#0a7")
@@ -1597,91 +1598,117 @@ class App(tk.Tk):
     def _pw_do_test(self):
         """Test both passwords against the gateway.
 
-        For WCP: SSH using the Current root pw, then run
-        'CareBloomPwd -v <wcp>' to ask the gateway if the WCP value in the
-        WCP password field is currently accepted.
+        Both checks use the CURRENT password fields - this is a pure
+        reachability/credentials check against the gateway, answering 'do
+        the Current passwords work right now?'. It does NOT inspect the
+        Root password / WCP password fields (those are the values Write
+        will SET, not values to verify here).
 
-        For ROOT: open a brief test SSH connection with the Root password
-        field as the credential. If it authenticates, that value matches
-        what's currently live on the gateway.
-
-        Both checks are reported independently so a 'one set, one not'
-        state is obvious. Current fields are the trusted SSH credentials;
-        the Root field is being VERIFIED against the gateway, not relied
-        on for any operation."""
+        For ROOT: open a brief SSH connection using the Current root pw.
+        If it authenticates, the Current root pw matches the gateway.
+        For WCP: on that same SSH session, run
+        'CareBloomPwd -v <Current WCP pw>' and parse its stdout. The
+        binary prints 'Password is valid' on success and 'Password is
+        incorrect' on failure; its exit code is unreliable (returns 0
+        even on a wrong password), so we match the stdout text."""
         try:
-            v = self._pw_validate_for_ssh()
-            if not v:
-                return
-            ip, root_new, wcp_new = v
+            ip = self.pw_ip.get().strip()
             cur_root = self.pw_current_root.get()
+            cur_wcp = self.pw_current_wcp.get()
+            if not ip:
+                self._pw_set_status("Gateway IP is empty.", "#c00")
+                self._pwresult("FAIL: gateway IP is empty.")
+                return
+            if not cur_root:
+                self._pw_set_status("Current root pw is empty.", "#c00")
+                self._pwresult("FAIL: Current root pw is empty.")
+                return
+            if not cur_wcp:
+                self._pw_set_status("Current WCP pw is empty.", "#c00")
+                self._pwresult("FAIL: Current WCP pw is empty.")
+                return
 
-            # --- Test WCP password (SSH as Current root, run CareBloomPwd -v) ---
-            self._pwresult(f"=== Test WCP password against {ip} ===")
-            wcp_ok = False
-            try:
-                c = paramiko.SSHClient()
-                c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                c.connect(hostname=ip, username="root",
-                          password=cur_root,
-                          timeout=10, allow_agent=False, look_for_keys=False)
-                cmd = ("/opt/lilypad/CARE001/main_app/CareBloomPwd -v "
-                       + shlex.quote(wcp_new))
-                _i, out, err = c.exec_command(cmd, timeout=15)
-                rc = out.channel.recv_exit_status()
-                stdout = out.read().decode(errors="replace").strip()
-                stderr = err.read().decode(errors="replace").strip()
-                c.close()
-                if rc == 0:
-                    wcp_ok = True
-                    self._pwresult("WCP password test: PASS "
-                                    "(CareBloomPwd -v accepted it).")
-                else:
-                    self._pwresult(f"WCP password test: FAIL "
-                                    f"(CareBloomPwd -v exit {rc}).")
-                if stdout:
-                    self._pwresult(f"  stdout: {stdout}")
-                if stderr:
-                    self._pwresult(f"  stderr: {stderr}")
-            except paramiko.AuthenticationException:
-                self._pwresult("WCP password test: ERROR — SSH could not "
-                                "authenticate with the Current root pw. "
-                                "Check that field.")
-            except Exception as e:
-                self._pwresult(f"WCP password test: ERROR ({e}).")
+            self._pwresult(f"=== Test Current passwords against {ip} ===")
 
-            # --- Test Root password (brief SSH with the Root field) ---
-            self._pwresult(f"=== Test Root password against {ip} ===")
+            # --- ROOT test: SSH with Current root pw. Reused session is
+            #     also used to drive the WCP check below.
             root_ok = False
+            wcp_ok = False
+            client = None
             try:
-                c = paramiko.SSHClient()
-                c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                c.connect(hostname=ip, username="root", password=root_new,
-                          timeout=10, allow_agent=False, look_for_keys=False)
-                c.close()
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                client.connect(hostname=ip, username="root",
+                               password=cur_root, timeout=10,
+                               allow_agent=False, look_for_keys=False)
                 root_ok = True
-                self._pwresult("Root password test: PASS (SSH accepted "
-                                "the Root password field value).")
+                self._pwresult("Root password: PASS (SSH accepted Current "
+                                "root pw).")
             except paramiko.AuthenticationException:
-                self._pwresult("Root password test: FAIL (SSH rejected "
-                                "the Root password field value). The "
-                                "gateway's live root password differs from "
-                                "what's in the Root password field.")
+                self._pwresult("Root password: FAIL (SSH rejected Current "
+                                "root pw). The Current root pw field does "
+                                "not match the gateway's live root password.")
             except Exception as e:
-                self._pwresult(f"Root password test: ERROR ({e}).")
+                self._pwresult(f"Root password: ERROR ({e}).")
+
+            # --- WCP test: only attempt if root SSH worked, otherwise we
+            #     have no way to run CareBloomPwd.
+            if root_ok and client is not None:
+                try:
+                    cmd = ("/opt/lilypad/CARE001/main_app/CareBloomPwd -v "
+                           + shlex.quote(cur_wcp))
+                    _i, out, err = client.exec_command(cmd, timeout=15)
+                    out.channel.recv_exit_status()  # drain, but ignore
+                    stdout = out.read().decode(errors="replace").strip()
+                    stderr = err.read().decode(errors="replace").strip()
+                    # CareBloomPwd's exit code is not reliable - it exits 0
+                    # even when the password is wrong. Match the stdout text
+                    # instead: 'Password is valid' on success, 'Password is
+                    # incorrect' on failure.
+                    if "valid" in stdout.lower():
+                        wcp_ok = True
+                        self._pwresult(f"WCP password: PASS "
+                                        f"(CareBloomPwd: {stdout}).")
+                    elif "incorrect" in stdout.lower():
+                        self._pwresult(f"WCP password: FAIL "
+                                        f"(CareBloomPwd: {stdout}). The "
+                                        "Current WCP pw field does not "
+                                        "match the gateway's live WCP "
+                                        "password.")
+                    else:
+                        # Unexpected output - treat as FAIL but log so we
+                        # can see what the binary actually said.
+                        self._pwresult(f"WCP password: UNEXPECTED OUTPUT - "
+                                        f"treating as FAIL.")
+                        if stdout:
+                            self._pwresult(f"  stdout: {stdout}")
+                        if stderr:
+                            self._pwresult(f"  stderr: {stderr}")
+                except Exception as e:
+                    self._pwresult(f"WCP password: ERROR ({e}).")
+            else:
+                self._pwresult("WCP password: SKIPPED (root SSH failed, "
+                                "so CareBloomPwd cannot be run).")
+
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
             # --- Summary ---
             if root_ok and wcp_ok:
-                self._pw_set_status("✓ Both passwords accepted.", "#080")
+                self._pw_set_status(
+                    "✓ Both Current passwords accepted.", "#080")
             elif root_ok or wcp_ok:
                 which = "root" if root_ok else "WCP"
                 missing = "WCP" if root_ok else "root"
                 self._pw_set_status(
-                    f"⚠ Partial: {which} accepted, {missing} not. "
-                    "See log.", "#a60")
+                    f"⚠ Partial: Current {which} accepted, "
+                    f"Current {missing} not. See log.", "#a60")
             else:
                 self._pw_set_status(
-                    "✗ Neither password accepted yet — see log.", "#c00")
+                    "✗ Neither Current password accepted — see log.", "#c00")
         finally:
             def reenable():
                 self.pw_test_btn.configure(state="normal")
