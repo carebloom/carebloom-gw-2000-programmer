@@ -1044,12 +1044,12 @@ class App(tk.Tk):
         row2 = ttk.Frame(inputs)
         row2.pack(fill="x", padx=8, pady=4)
         ttk.Label(row2, text="Root seed:", width=18).pack(side="left")
-        ttk.Entry(row2, textvariable=self.pw_root_seed, width=22).pack(
-            side="left", padx=4)
+        ttk.Entry(row2, textvariable=self.pw_root_seed, width=22,
+                  state="readonly").pack(side="left", padx=4)
         ttk.Label(row2, text="WCP seed:", width=12).pack(
             side="left", padx=(16, 0))
-        ttk.Entry(row2, textvariable=self.pw_wcp_seed, width=22).pack(
-            side="left", padx=4)
+        ttk.Entry(row2, textvariable=self.pw_wcp_seed, width=22,
+                  state="readonly").pack(side="left", padx=4)
 
         row3 = ttk.Frame(inputs)
         row3.pack(fill="x", padx=8, pady=4)
@@ -1061,8 +1061,13 @@ class App(tk.Tk):
         ttk.Entry(row3, textvariable=self.pw_current_wcp, width=22).pack(
             side="left", padx=4)
 
-        # --- Outputs: the generated / typed new passwords ---------------
-        outputs = ttk.LabelFrame(wrap, text="Generated passwords")
+        # --- Passwords frame: the values to be WRITTEN. The operator can
+        # populate these by clicking Generate (algorithmic hex from MAC+seed)
+        # or by typing them directly - any value is accepted, including
+        # restoring the factory default 'carebloom-eng'. Test and Write
+        # always authenticate to the gateway using the Current pw fields
+        # above, and Write sets the gateway's passwords to these values.
+        outputs = ttk.LabelFrame(wrap, text="Passwords")
         outputs.pack(fill="x", pady=8)
 
         orow1 = ttk.Frame(outputs)
@@ -1077,12 +1082,21 @@ class App(tk.Tk):
         ttk.Entry(orow2, textvariable=self.pw_wcp_out, width=22).pack(
             side="left", padx=4)
 
+        # Generate is inside the Passwords frame because what it does -
+        # populating the two password fields - is conceptually part of the
+        # frame, not a separate action like Test or Write.
+        genrow = ttk.Frame(outputs)
+        genrow.pack(fill="x", padx=8, pady=(2, 6))
+        self.pw_generate_btn = ttk.Button(
+            genrow, text="Generate", command=self._pw_generate)
+        self.pw_generate_btn.pack(side="left", ipadx=14, ipady=4)
+        ttk.Label(genrow,
+                  text="(SHA-256 of MAC + seed, first 12 hex chars)",
+                  foreground="#888").pack(side="left", padx=8)
+
         # --- Action buttons --------------------------------------------
         ctrl = ttk.Frame(wrap)
         ctrl.pack(fill="x", pady=8)
-        self.pw_generate_btn = ttk.Button(
-            ctrl, text="Generate", command=self._pw_generate)
-        self.pw_generate_btn.pack(side="left", padx=4, ipadx=14, ipady=4)
         self.pw_test_btn = ttk.Button(
             ctrl, text="Test", command=self._start_pw_test_thread)
         self.pw_test_btn.pack(side="left", padx=4, ipadx=14, ipady=4)
@@ -1539,10 +1553,13 @@ class App(tk.Tk):
         self._pw_set_status("Passwords generated.", "#080")
 
     def _pw_validate_for_ssh(self):
-        """Common pre-flight for Test / Write: check IP, current root pw,
-        and that both new passwords are non-empty 12-char hex. Returns the
-        triple (ip, root_new, wcp_new) on success, or None (and logs the
-        error) on failure."""
+        """Common pre-flight for Test / Write: confirm the IP is set, the
+        Current root pw is set (it's the SSH credential), and the new
+        Root / WCP password fields are not empty. The values themselves are
+        NOT format-restricted - any string is accepted, including the
+        factory default 'carebloom-eng', so a board can be reverted as
+        easily as it can be rotated to a hex value. Returns the triple
+        (ip, root_new, wcp_new) on success, or None (and logs) on failure."""
         ip = self.pw_ip.get().strip()
         if not ip:
             self._pw_set_status("Gateway IP is empty.", "#c00")
@@ -1552,20 +1569,15 @@ class App(tk.Tk):
             self._pw_set_status("Current root password is empty.", "#c00")
             self._pwresult("FAIL: current root password is empty.")
             return None
-        root_new = self.pw_root_out.get().strip()
-        wcp_new = self.pw_wcp_out.get().strip()
-        hex12 = re.compile(r"^[0-9a-f]{12}$")
-        if not hex12.match(root_new):
-            self._pw_set_status(
-                "Root password must be 12 lowercase hex chars.", "#c00")
-            self._pwresult(f"FAIL: root password '{root_new}' is not "
-                            "12 lowercase hex chars.")
+        root_new = self.pw_root_out.get()
+        wcp_new = self.pw_wcp_out.get()
+        if not root_new:
+            self._pw_set_status("Root password field is empty.", "#c00")
+            self._pwresult("FAIL: root password field is empty.")
             return None
-        if not hex12.match(wcp_new):
-            self._pw_set_status(
-                "WCP password must be 12 lowercase hex chars.", "#c00")
-            self._pwresult(f"FAIL: WCP password '{wcp_new}' is not "
-                            "12 lowercase hex chars.")
+        if not wcp_new:
+            self._pw_set_status("WCP password field is empty.", "#c00")
+            self._pwresult("FAIL: WCP password field is empty.")
             return None
         return ip, root_new, wcp_new
 
@@ -1585,50 +1597,33 @@ class App(tk.Tk):
     def _pw_do_test(self):
         """Test both passwords against the gateway.
 
-        For ROOT: try SSH as root with the new root password. If the
-        connection succeeds, the password is the live one.
+        For WCP: SSH using the Current root pw, then run
+        'CareBloomPwd -v <wcp>' to ask the gateway if the WCP value in the
+        WCP password field is currently accepted.
 
-        For WCP: SSH as root with the configured 'current root' password
-        and run CareBloomPwd -v <wcp> on the gateway. CareBloomPwd's
-        verify exit code tells us if the WCP password is accepted.
+        For ROOT: open a brief test SSH connection with the Root password
+        field as the credential. If it authenticates, that value matches
+        what's currently live on the gateway.
 
         Both checks are reported independently so a 'one set, one not'
-        state is obvious."""
+        state is obvious. Current fields are the trusted SSH credentials;
+        the Root field is being VERIFIED against the gateway, not relied
+        on for any operation."""
         try:
             v = self._pw_validate_for_ssh()
             if not v:
                 return
             ip, root_new, wcp_new = v
+            cur_root = self.pw_current_root.get()
 
-            # --- Test root password ---
-            self._pwresult(f"=== Test root password against {ip} ===")
-            root_ok = False
-            try:
-                c = paramiko.SSHClient()
-                c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                c.connect(hostname=ip, username="root", password=root_new,
-                          timeout=10, allow_agent=False, look_for_keys=False)
-                c.close()
-                root_ok = True
-                self._pwresult("Root password test: PASS (SSH accepted "
-                                "the new root password).")
-            except paramiko.AuthenticationException:
-                self._pwresult("Root password test: FAIL (SSH rejected "
-                                "the new root password). It has not been "
-                                "written yet, or differs from this value.")
-            except Exception as e:
-                self._pwresult(f"Root password test: ERROR ({e}).")
-
-            # --- Test WCP password ---
+            # --- Test WCP password (SSH as Current root, run CareBloomPwd -v) ---
             self._pwresult(f"=== Test WCP password against {ip} ===")
             wcp_ok = False
-            wcp_pw_for_login = (root_new if root_ok
-                                else self.pw_current_root.get())
             try:
                 c = paramiko.SSHClient()
                 c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
                 c.connect(hostname=ip, username="root",
-                          password=wcp_pw_for_login,
+                          password=cur_root,
                           timeout=10, allow_agent=False, look_for_keys=False)
                 cmd = ("/opt/lilypad/CARE001/main_app/CareBloomPwd -v "
                        + shlex.quote(wcp_new))
@@ -1649,11 +1644,31 @@ class App(tk.Tk):
                 if stderr:
                     self._pwresult(f"  stderr: {stderr}")
             except paramiko.AuthenticationException:
-                self._pwresult("WCP password test: ERROR — could not log "
-                                "in to run CareBloomPwd. Check the current "
-                                "root password.")
+                self._pwresult("WCP password test: ERROR — SSH could not "
+                                "authenticate with the Current root pw. "
+                                "Check that field.")
             except Exception as e:
                 self._pwresult(f"WCP password test: ERROR ({e}).")
+
+            # --- Test Root password (brief SSH with the Root field) ---
+            self._pwresult(f"=== Test Root password against {ip} ===")
+            root_ok = False
+            try:
+                c = paramiko.SSHClient()
+                c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                c.connect(hostname=ip, username="root", password=root_new,
+                          timeout=10, allow_agent=False, look_for_keys=False)
+                c.close()
+                root_ok = True
+                self._pwresult("Root password test: PASS (SSH accepted "
+                                "the Root password field value).")
+            except paramiko.AuthenticationException:
+                self._pwresult("Root password test: FAIL (SSH rejected "
+                                "the Root password field value). The "
+                                "gateway's live root password differs from "
+                                "what's in the Root password field.")
+            except Exception as e:
+                self._pwresult(f"Root password test: ERROR ({e}).")
 
             # --- Summary ---
             if root_ok and wcp_ok:
@@ -1759,6 +1774,13 @@ class App(tk.Tk):
                 if rc == 0:
                     wcp_ok = True
                     self._pwresult("WCP password: SET.")
+                    # Auto-sync: the gateway's live WCP is now wcp_new, so
+                    # the Current WCP field should track it. Done from the
+                    # UI thread because StringVar.set touches Tk state.
+                    self.after(0, lambda v=wcp_new:
+                               self.pw_current_wcp.set(v))
+                    self._pwresult(f"Current WCP pw field synced to "
+                                    "the new value.")
                 else:
                     self._pwresult(f"WCP password: FAIL "
                                     f"(CareBloomPwd exit {rc}).")
@@ -1782,6 +1804,13 @@ class App(tk.Tk):
                 if rc == 0:
                     root_ok = True
                     self._pwresult("Root password: SET.")
+                    # Auto-sync: live root pw is now root_new. Updating
+                    # Current root means a subsequent Test / Write can
+                    # re-authenticate without any manual edit.
+                    self.after(0, lambda v=root_new:
+                               self.pw_current_root.set(v))
+                    self._pwresult(f"Current root pw field synced to "
+                                    "the new value.")
                 else:
                     self._pwresult(f"Root password: FAIL "
                                     f"(chpasswd exit {rc}).")
@@ -1793,13 +1822,10 @@ class App(tk.Tk):
 
             # --- Summary ---
             if wcp_ok and root_ok:
-                # If this was the same board last verified, update the
-                # cached current pw so a subsequent Test uses the new
-                # values without manual edit.
                 self._pw_set_status("✓ Both passwords written.", "#080")
                 self._pwresult(
-                    "Both passwords written. Click Test to verify, or "
-                    "proceed to Label Generation.")
+                    "Both passwords written. Current fields are now in "
+                    "sync with the live gateway state.")
             elif wcp_ok or root_ok:
                 which = "WCP" if wcp_ok else "root"
                 missing = "root" if wcp_ok else "WCP"
@@ -4400,3 +4426,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
