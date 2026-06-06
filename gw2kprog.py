@@ -24,6 +24,7 @@ import shlex
 import queue
 import socket
 import shutil
+import hashlib
 import secrets
 import threading
 import subprocess
@@ -99,6 +100,7 @@ TRANSCRIPT_DIR = str(Path.home() / "gw2k-programmer-logs")
 PROGRAM_LOG = os.path.join(TRANSCRIPT_DIR, "program_transcript.log")
 VERIFY_LOG = os.path.join(TRANSCRIPT_DIR, "verify_transcript.log")
 INSTALL_LOG = os.path.join(TRANSCRIPT_DIR, "install_transcript.log")
+PASSWORD_LOG = os.path.join(TRANSCRIPT_DIR, "password_transcript.log")
 
 # -----------------------------------------------------------------------------
 # Label generation (Zebra ZD410 thermal printer, ZPL over raw USB)
@@ -623,6 +625,21 @@ class App(tk.Tk):
         self.app_name = tk.StringVar(value=DEFAULT_APP_NAME)
         self.install_host = tk.StringVar(value="")
 
+        # Password modification
+        # Defaults match the post-install state of a freshly-installed gateway:
+        # both root and Web Control Panel passwords are the constant string
+        # "carebloom-eng" until they're rotated here. Seeds default to the
+        # values the legacy password tool used, so passwords generated here
+        # are bit-compatible with what that tool would have produced.
+        self.pw_mac = tk.StringVar(value="")
+        self.pw_ip = tk.StringVar(value="")
+        self.pw_root_seed = tk.StringVar(value="root_seed")
+        self.pw_wcp_seed = tk.StringVar(value="web_seed")
+        self.pw_current_root = tk.StringVar(value="carebloom-eng")
+        self.pw_current_wcp = tk.StringVar(value="carebloom-eng")
+        self.pw_root_out = tk.StringVar(value="")
+        self.pw_wcp_out = tk.StringVar(value="")
+
         # Label generation
         self.label_mac = tk.StringVar(value="")
         self.label_lot = tk.StringVar(value="")
@@ -686,18 +703,21 @@ class App(tk.Tk):
         self.program_tab = ttk.Frame(nb)
         self.verify_tab = ttk.Frame(nb)
         self.install_tab = ttk.Frame(nb)
+        self.password_tab = ttk.Frame(nb)
         self.label_tab = ttk.Frame(nb)
         nb.add(self.cfg_tab, text="1. Configure")
         nb.add(self.program_tab, text="2. Program")
         nb.add(self.verify_tab, text="3. Verify")
         nb.add(self.install_tab, text="4. App Installation")
-        nb.add(self.label_tab, text="5. Label Generation")
+        nb.add(self.password_tab, text="5. Password Modification")
+        nb.add(self.label_tab, text="6. Label Generation")
         self.notebook = nb
 
         self._build_cfg_tab(self.cfg_tab)
         self._build_program_tab(self.program_tab)
         self._build_verify_tab(self.verify_tab)
         self._build_install_tab(self.install_tab)
+        self._build_password_tab(self.password_tab)
         self._build_label_tab(self.label_tab)
 
     def _row(self, parent, r, label, var, browse=None, show=None, hint=""):
@@ -976,6 +996,114 @@ class App(tk.Tk):
         # Where the full install transcript is written, so it can be shared.
         ttk.Label(statusf,
                   text=f"Full transcript saved to: {INSTALL_LOG}",
+                  foreground="#888").pack(anchor="w", padx=6, pady=(0, 6))
+
+    # ---- Password modification tab ----------------------------------------
+    def _build_password_tab(self, parent):
+        """Rotate the gateway's root and Web Control Panel passwords from
+        the post-install defaults ('carebloom-eng') to unique 12-char
+        hex values derived from the gateway MAC plus a per-password seed.
+
+        SECURITY NOTE: the scheme is deterministic from values that are
+        either printed on the device label (the MAC) or stored in this
+        source file (the seed defaults). It is therefore not a secret-
+        keeping scheme; it provides per-device uniqueness, not unguessable
+        randomness. This matches the legacy tool's behavior. If unguessable
+        per-device secrets are required (e.g. for a future security
+        review), the seeds should move to a per-host secret store and the
+        operator should not be able to see or edit them in the GUI."""
+        wrap = ttk.Frame(parent, padding=12)
+        wrap.pack(fill="both", expand=True)
+
+        intro = ttk.Label(wrap, justify="left", text=(
+            "Rotates the gateway's root and Web Control Panel (WCP) "
+            "passwords. After App Installation, both passwords are the "
+            "constant 'carebloom-eng'. Each gateway must be rotated to "
+            "unique 12-char hex passwords (derived from the gateway MAC "
+            "plus a seed) before it is boxed and shipped."))
+        intro.pack(anchor="w", fill="x")
+        intro.bind("<Configure>",
+                   lambda e: intro.configure(wraplength=e.width - 4))
+
+        # --- Inputs: MAC, IP, seeds, current root pw -------------------
+        inputs = ttk.LabelFrame(wrap, text="Inputs")
+        inputs.pack(fill="x", pady=8)
+
+        row1 = ttk.Frame(inputs)
+        row1.pack(fill="x", padx=8, pady=4)
+        ttk.Label(row1, text="Gateway MAC:", width=18).pack(side="left")
+        ttk.Entry(row1, textvariable=self.pw_mac, width=22).pack(
+            side="left", padx=4)
+        ttk.Label(row1, text="Gateway IP:", width=12).pack(
+            side="left", padx=(16, 0))
+        ttk.Entry(row1, textvariable=self.pw_ip, width=16).pack(
+            side="left", padx=4)
+        ttk.Button(row1, text="Use verified board",
+                   command=self._pw_use_verified).pack(side="left", padx=8)
+
+        row2 = ttk.Frame(inputs)
+        row2.pack(fill="x", padx=8, pady=4)
+        ttk.Label(row2, text="Root seed:", width=18).pack(side="left")
+        ttk.Entry(row2, textvariable=self.pw_root_seed, width=22).pack(
+            side="left", padx=4)
+        ttk.Label(row2, text="WCP seed:", width=12).pack(
+            side="left", padx=(16, 0))
+        ttk.Entry(row2, textvariable=self.pw_wcp_seed, width=22).pack(
+            side="left", padx=4)
+
+        row3 = ttk.Frame(inputs)
+        row3.pack(fill="x", padx=8, pady=4)
+        ttk.Label(row3, text="Current root pw:", width=18).pack(side="left")
+        ttk.Entry(row3, textvariable=self.pw_current_root, width=22).pack(
+            side="left", padx=4)
+        ttk.Label(row3, text="Current WCP pw:", width=14).pack(
+            side="left", padx=(14, 0))
+        ttk.Entry(row3, textvariable=self.pw_current_wcp, width=22).pack(
+            side="left", padx=4)
+
+        # --- Outputs: the generated / typed new passwords ---------------
+        outputs = ttk.LabelFrame(wrap, text="Generated passwords")
+        outputs.pack(fill="x", pady=8)
+
+        orow1 = ttk.Frame(outputs)
+        orow1.pack(fill="x", padx=8, pady=4)
+        ttk.Label(orow1, text="Root password:", width=18).pack(side="left")
+        ttk.Entry(orow1, textvariable=self.pw_root_out, width=22).pack(
+            side="left", padx=4)
+
+        orow2 = ttk.Frame(outputs)
+        orow2.pack(fill="x", padx=8, pady=4)
+        ttk.Label(orow2, text="WCP password:", width=18).pack(side="left")
+        ttk.Entry(orow2, textvariable=self.pw_wcp_out, width=22).pack(
+            side="left", padx=4)
+
+        # --- Action buttons --------------------------------------------
+        ctrl = ttk.Frame(wrap)
+        ctrl.pack(fill="x", pady=8)
+        self.pw_generate_btn = ttk.Button(
+            ctrl, text="Generate", command=self._pw_generate)
+        self.pw_generate_btn.pack(side="left", padx=4, ipadx=14, ipady=4)
+        self.pw_test_btn = ttk.Button(
+            ctrl, text="Test", command=self._start_pw_test_thread)
+        self.pw_test_btn.pack(side="left", padx=4, ipadx=14, ipady=4)
+        self.pw_write_btn = ttk.Button(
+            ctrl, text="Write", command=self._start_pw_write_thread)
+        self.pw_write_btn.pack(side="left", padx=4, ipadx=14, ipady=4)
+
+        # --- Status frame -----------------------------------------------
+        statusf = ttk.LabelFrame(wrap, text="Status")
+        statusf.pack(fill="both", expand=True, pady=(8, 0))
+
+        self.pw_status = ttk.Label(statusf, text="Ready.",
+                                    font=("DejaVu Sans", 13))
+        self.pw_status.pack(anchor="w", padx=6, pady=6)
+
+        self.pw_results = scrolledtext.ScrolledText(
+            statusf, height=14, wrap="word", font=("DejaVu Sans Mono", 10))
+        self.pw_results.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        ttk.Label(statusf,
+                  text=f"Full transcript saved to: {PASSWORD_LOG}",
                   foreground="#888").pack(anchor="w", padx=6, pady=(0, 6))
 
     # ---- Label generation tab ---------------------------------------------
@@ -1320,6 +1448,376 @@ class App(tk.Tk):
             messagebox.showinfo(
                 "No verified board",
                 "Run the Verify tab first, or type a hostname/IP manually.")
+
+    # ---- Password modification handlers -----------------------------------
+
+    def _pwresult(self, s):
+        """Append a line to the Password tab status pane and the transcript.
+        Mirrors _iresult / _result; safe to call from any thread."""
+        self._write_transcript(PASSWORD_LOG, s)
+        def upd():
+            self.pw_results.insert("end", s + "\n")
+            self.pw_results.see("end")
+        self.after(0, upd)
+
+    def _pw_set_status(self, text, color="#000"):
+        self.after(0, lambda: self.pw_status.configure(
+            text=text, foreground=color))
+
+    @staticmethod
+    def _pw_normalize_mac(raw):
+        """Strip the MAC down to lowercase, no separators. Returns '' if the
+        result isn't 12 hex chars. The legacy password tool fed the MAC into
+        the hash in exactly this form, so matching it bit-for-bit is what
+        makes a password generated here equal one generated by the old
+        tool for the same MAC + seed."""
+        hex_only = re.sub(r"[^0-9A-Fa-f]", "", raw or "").lower()
+        return hex_only if len(hex_only) == 12 else ""
+
+    @staticmethod
+    def _pw_hash(mac_clean, seed):
+        """SHA-256 hex digest of (mac + seed), truncated to 12 chars. The
+        SHA-256 hex alphabet is [0-9a-f], so the first 12 chars are by
+        construction a 12-char hex string."""
+        return hashlib.sha256(
+            (mac_clean + seed).encode("utf-8")).hexdigest()[:12]
+
+    def _pw_use_verified(self):
+        """Pre-fill MAC and IP from the most recent verified board."""
+        ip = self.found_ip.get().strip()
+        mac = getattr(self, "found_mac", "") or ""
+        if not (ip or mac):
+            messagebox.showinfo(
+                "No verified board",
+                "Run the Verify tab first, or type the MAC and IP manually.")
+            return
+        if mac:
+            self.pw_mac.set(mac)
+        if ip:
+            self.pw_ip.set(ip)
+        self._pwresult(f"Loaded from last verified board: "
+                        f"MAC={mac or '(unknown)'}, IP={ip or '(unknown)'}")
+
+    def _pw_generate(self):
+        """Generate button: derive new passwords from MAC + seeds.
+        Pure local computation - no SSH, no network."""
+        # Truncate the status pane each Generate so successive runs aren't
+        # confused with each other in the log.
+        self._start_transcript(PASSWORD_LOG, "GW2000 Password Modification")
+        self.pw_results.delete("1.0", "end")
+
+        mac_clean = self._pw_normalize_mac(self.pw_mac.get())
+        if not mac_clean:
+            self._pw_set_status(
+                "MAC must be 12 hex characters (colons optional).", "#c00")
+            self._pwresult(f"FAIL: MAC '{self.pw_mac.get()}' is not "
+                            "12 hex characters.")
+            return
+        root_seed = self.pw_root_seed.get()
+        wcp_seed = self.pw_wcp_seed.get()
+        if not root_seed or not wcp_seed:
+            self._pw_set_status("Both seeds must be set.", "#c00")
+            self._pwresult("FAIL: a seed is empty.")
+            return
+
+        # Warn (don't block) if the operator changed a seed away from the
+        # default - a typo here would generate non-matching passwords.
+        if root_seed != "root_seed":
+            self._pwresult(f"NOTE: root seed is '{root_seed}' "
+                            "(default is 'root_seed').")
+        if wcp_seed != "web_seed":
+            self._pwresult(f"NOTE: WCP seed is '{wcp_seed}' "
+                            "(default is 'web_seed').")
+
+        root_pw = self._pw_hash(mac_clean, root_seed)
+        wcp_pw = self._pw_hash(mac_clean, wcp_seed)
+        self.pw_root_out.set(root_pw)
+        self.pw_wcp_out.set(wcp_pw)
+        self._pwresult(f"MAC (normalized): {mac_clean}")
+        self._pwresult(f"Generated root password: {root_pw}")
+        self._pwresult(f"Generated WCP password:  {wcp_pw}")
+        self._pw_set_status("Passwords generated.", "#080")
+
+    def _pw_validate_for_ssh(self):
+        """Common pre-flight for Test / Write: check IP, current root pw,
+        and that both new passwords are non-empty 12-char hex. Returns the
+        triple (ip, root_new, wcp_new) on success, or None (and logs the
+        error) on failure."""
+        ip = self.pw_ip.get().strip()
+        if not ip:
+            self._pw_set_status("Gateway IP is empty.", "#c00")
+            self._pwresult("FAIL: gateway IP is empty.")
+            return None
+        if not self.pw_current_root.get():
+            self._pw_set_status("Current root password is empty.", "#c00")
+            self._pwresult("FAIL: current root password is empty.")
+            return None
+        root_new = self.pw_root_out.get().strip()
+        wcp_new = self.pw_wcp_out.get().strip()
+        hex12 = re.compile(r"^[0-9a-f]{12}$")
+        if not hex12.match(root_new):
+            self._pw_set_status(
+                "Root password must be 12 lowercase hex chars.", "#c00")
+            self._pwresult(f"FAIL: root password '{root_new}' is not "
+                            "12 lowercase hex chars.")
+            return None
+        if not hex12.match(wcp_new):
+            self._pw_set_status(
+                "WCP password must be 12 lowercase hex chars.", "#c00")
+            self._pwresult(f"FAIL: WCP password '{wcp_new}' is not "
+                            "12 lowercase hex chars.")
+            return None
+        return ip, root_new, wcp_new
+
+    def _start_pw_test_thread(self):
+        if paramiko is None:
+            messagebox.showerror("paramiko missing",
+                                  "paramiko is required for Test.")
+            return
+        if not self._pw_validate_for_ssh():
+            return
+        # Don't truncate the transcript here - keep Generate's log visible.
+        self.pw_test_btn.configure(state="disabled")
+        self.pw_write_btn.configure(state="disabled")
+        self._pw_set_status("Testing passwords…", "#0a7")
+        threading.Thread(target=self._pw_do_test, daemon=True).start()
+
+    def _pw_do_test(self):
+        """Test both passwords against the gateway.
+
+        For ROOT: try SSH as root with the new root password. If the
+        connection succeeds, the password is the live one.
+
+        For WCP: SSH as root with the configured 'current root' password
+        and run CareBloomPwd -v <wcp> on the gateway. CareBloomPwd's
+        verify exit code tells us if the WCP password is accepted.
+
+        Both checks are reported independently so a 'one set, one not'
+        state is obvious."""
+        try:
+            v = self._pw_validate_for_ssh()
+            if not v:
+                return
+            ip, root_new, wcp_new = v
+
+            # --- Test root password ---
+            self._pwresult(f"=== Test root password against {ip} ===")
+            root_ok = False
+            try:
+                c = paramiko.SSHClient()
+                c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                c.connect(hostname=ip, username="root", password=root_new,
+                          timeout=10, allow_agent=False, look_for_keys=False)
+                c.close()
+                root_ok = True
+                self._pwresult("Root password test: PASS (SSH accepted "
+                                "the new root password).")
+            except paramiko.AuthenticationException:
+                self._pwresult("Root password test: FAIL (SSH rejected "
+                                "the new root password). It has not been "
+                                "written yet, or differs from this value.")
+            except Exception as e:
+                self._pwresult(f"Root password test: ERROR ({e}).")
+
+            # --- Test WCP password ---
+            self._pwresult(f"=== Test WCP password against {ip} ===")
+            wcp_ok = False
+            wcp_pw_for_login = (root_new if root_ok
+                                else self.pw_current_root.get())
+            try:
+                c = paramiko.SSHClient()
+                c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                c.connect(hostname=ip, username="root",
+                          password=wcp_pw_for_login,
+                          timeout=10, allow_agent=False, look_for_keys=False)
+                cmd = ("/opt/lilypad/CARE001/main_app/CareBloomPwd -v "
+                       + shlex.quote(wcp_new))
+                _i, out, err = c.exec_command(cmd, timeout=15)
+                rc = out.channel.recv_exit_status()
+                stdout = out.read().decode(errors="replace").strip()
+                stderr = err.read().decode(errors="replace").strip()
+                c.close()
+                if rc == 0:
+                    wcp_ok = True
+                    self._pwresult("WCP password test: PASS "
+                                    "(CareBloomPwd -v accepted it).")
+                else:
+                    self._pwresult(f"WCP password test: FAIL "
+                                    f"(CareBloomPwd -v exit {rc}).")
+                if stdout:
+                    self._pwresult(f"  stdout: {stdout}")
+                if stderr:
+                    self._pwresult(f"  stderr: {stderr}")
+            except paramiko.AuthenticationException:
+                self._pwresult("WCP password test: ERROR — could not log "
+                                "in to run CareBloomPwd. Check the current "
+                                "root password.")
+            except Exception as e:
+                self._pwresult(f"WCP password test: ERROR ({e}).")
+
+            # --- Summary ---
+            if root_ok and wcp_ok:
+                self._pw_set_status("✓ Both passwords accepted.", "#080")
+            elif root_ok or wcp_ok:
+                which = "root" if root_ok else "WCP"
+                missing = "WCP" if root_ok else "root"
+                self._pw_set_status(
+                    f"⚠ Partial: {which} accepted, {missing} not. "
+                    "See log.", "#a60")
+            else:
+                self._pw_set_status(
+                    "✗ Neither password accepted yet — see log.", "#c00")
+        finally:
+            def reenable():
+                self.pw_test_btn.configure(state="normal")
+                self.pw_write_btn.configure(state="normal")
+            self.after(0, reenable)
+
+    def _start_pw_write_thread(self):
+        if paramiko is None:
+            messagebox.showerror("paramiko missing",
+                                  "paramiko is required for Write.")
+            return
+        if not self._pw_validate_for_ssh():
+            return
+        # Confirm - Write is destructive (changes the gateway's passwords).
+        if not messagebox.askyesno(
+                "Write passwords",
+                "This will change the gateway's root and Web Control Panel "
+                "passwords to the values shown. Continue?"):
+            return
+        self.pw_test_btn.configure(state="disabled")
+        self.pw_write_btn.configure(state="disabled")
+        self._pw_set_status("Writing passwords…", "#0a7")
+        threading.Thread(target=self._pw_do_write, daemon=True).start()
+
+    def _pw_do_write(self):
+        """Write both passwords to the gateway, in this order:
+          1) WCP first (CareBloomPwd -s <current> <new>) - does not affect
+             the SSH session.
+          2) Root last (echo root:<new> | chpasswd) - this also changes the
+             credential the current SSH session was authenticated with;
+             paramiko keeps the existing session usable, but any NEW
+             session would have to use the new root password. By doing
+             root last we never need to re-authenticate within Write.
+
+        Both operations happen on a single SSH session. Partial failures
+        (one set, one not) are reported explicitly - the gateway is then in
+        a known mixed state, which is recoverable by re-running Write or
+        adjusting the Current fields and trying again."""
+        try:
+            v = self._pw_validate_for_ssh()
+            if not v:
+                return
+            ip, root_new, wcp_new = v
+            cur_root = self.pw_current_root.get()
+            cur_wcp = self.pw_current_wcp.get()
+
+            self._pwresult(f"=== Write passwords to {ip} ===")
+            client = None
+            try:
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                client.connect(hostname=ip, username="root",
+                               password=cur_root, timeout=10,
+                               allow_agent=False, look_for_keys=False)
+            except paramiko.AuthenticationException:
+                self._pwresult("FAIL: SSH could not authenticate with the "
+                                "Current root password. Nothing written.")
+                self._pw_set_status(
+                    "✗ SSH auth failed — nothing written.", "#c00")
+                return
+            except Exception as e:
+                self._pwresult(f"FAIL: SSH connect error: {e}. "
+                                "Nothing written.")
+                self._pw_set_status(
+                    f"✗ SSH connect failed — nothing written.", "#c00")
+                return
+
+            wcp_ok = False
+            root_ok = False
+            try:
+                # --- 1) WCP password via CareBloomPwd ---
+                self._pwresult("Setting WCP password (CareBloomPwd -s)…")
+                # Make sure CareBloomPwd is executable (the legacy tool did
+                # this too; harmless if already +x).
+                _i, _o, _e = client.exec_command(
+                    "chmod +x /opt/lilypad/CARE001/main_app/CareBloomPwd",
+                    timeout=15)
+                _o.channel.recv_exit_status()
+                cmd = ("/opt/lilypad/CARE001/main_app/CareBloomPwd -s "
+                       + shlex.quote(cur_wcp) + " "
+                       + shlex.quote(wcp_new))
+                _i, out, err = client.exec_command(cmd, timeout=20)
+                rc = out.channel.recv_exit_status()
+                so = out.read().decode(errors="replace").strip()
+                se = err.read().decode(errors="replace").strip()
+                if so:
+                    self._pwresult(f"  stdout: {so}")
+                if se:
+                    self._pwresult(f"  stderr: {se}")
+                if rc == 0:
+                    wcp_ok = True
+                    self._pwresult("WCP password: SET.")
+                else:
+                    self._pwresult(f"WCP password: FAIL "
+                                    f"(CareBloomPwd exit {rc}).")
+
+                # --- 2) Root password via chpasswd ---
+                self._pwresult("Setting root password (chpasswd)…")
+                # Use stdin so the new password never appears in a process
+                # listing or shell history on the gateway.
+                cmd = "chpasswd"
+                stdin, out, err = client.exec_command(cmd, timeout=15)
+                stdin.write(f"root:{root_new}\n")
+                stdin.flush()
+                stdin.channel.shutdown_write()
+                rc = out.channel.recv_exit_status()
+                so = out.read().decode(errors="replace").strip()
+                se = err.read().decode(errors="replace").strip()
+                if so:
+                    self._pwresult(f"  stdout: {so}")
+                if se:
+                    self._pwresult(f"  stderr: {se}")
+                if rc == 0:
+                    root_ok = True
+                    self._pwresult("Root password: SET.")
+                else:
+                    self._pwresult(f"Root password: FAIL "
+                                    f"(chpasswd exit {rc}).")
+            finally:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+            # --- Summary ---
+            if wcp_ok and root_ok:
+                # If this was the same board last verified, update the
+                # cached current pw so a subsequent Test uses the new
+                # values without manual edit.
+                self._pw_set_status("✓ Both passwords written.", "#080")
+                self._pwresult(
+                    "Both passwords written. Click Test to verify, or "
+                    "proceed to Label Generation.")
+            elif wcp_ok or root_ok:
+                which = "WCP" if wcp_ok else "root"
+                missing = "root" if wcp_ok else "WCP"
+                self._pw_set_status(
+                    f"⚠ Partial write: {which} set, {missing} not. "
+                    "See log.", "#a60")
+                self._pwresult(
+                    f"WARNING: gateway is now in a MIXED state. "
+                    f"{which} = new value, {missing} = old value. "
+                    "Re-run Write to retry, or fix the inputs first.")
+            else:
+                self._pw_set_status(
+                    "✗ Neither password written — see log.", "#c00")
+        finally:
+            def reenable():
+                self.pw_test_btn.configure(state="normal")
+                self.pw_write_btn.configure(state="normal")
+            self.after(0, reenable)
 
     def _set_install_step(self, idx, status):
         glyph = {"pending": ("○", "#888"),
