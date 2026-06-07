@@ -1813,12 +1813,30 @@ class App(tk.Tk):
                                     f"(CareBloomPwd exit {rc}).")
 
                 # --- 2) Root password via chpasswd ---
-                self._pwresult("Setting root password (chpasswd)…")
+                # Set BOTH 'root' and 'pi' to the same password. The 'pi'
+                # user is the OS-level account created by firstrun.sh from
+                # the Configure tab's Username field (default 'pi'); from
+                # the Passwords tab on it must stay in lockstep with root.
+                # We check whether 'pi' exists first - on a board where the
+                # operator chose a non-'pi' username, skipping the 'pi'
+                # line avoids a chpasswd failure that would mask the root
+                # result.
+                self._pwresult("Setting root + pi password (chpasswd)…")
+                _i, idout, _e = client.exec_command(
+                    "id -u pi >/dev/null 2>&1 && echo yes || echo no",
+                    timeout=10)
+                idout.channel.recv_exit_status()
+                pi_exists = (idout.read().decode(errors="replace").strip()
+                             == "yes")
+
                 # Use stdin so the new password never appears in a process
-                # listing or shell history on the gateway.
+                # listing or shell history on the gateway. chpasswd reads
+                # 'user:password' lines and updates all in one shadow write.
                 cmd = "chpasswd"
                 stdin, out, err = client.exec_command(cmd, timeout=15)
                 stdin.write(f"root:{root_new}\n")
+                if pi_exists:
+                    stdin.write(f"pi:{root_new}\n")
                 stdin.flush()
                 stdin.channel.shutdown_write()
                 rc = out.channel.recv_exit_status()
@@ -1830,7 +1848,8 @@ class App(tk.Tk):
                     self._pwresult(f"  stderr: {se}")
                 if rc == 0:
                     root_ok = True
-                    self._pwresult("Root password: SET.")
+                    accounts = "root + pi" if pi_exists else "root"
+                    self._pwresult(f"Root password: SET ({accounts}).")
                     # Auto-sync: live root pw is now root_new. Updating
                     # Current root means a subsequent Test / Write can
                     # re-authenticate without any manual edit.
