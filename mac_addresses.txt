@@ -1,0 +1,43 @@
+Care Bloom Gateways - first production run at Darko
+
+
+ra_2ntgZ0RNSo0OPGULRPhZYZC26Gp 5.tcp.ngrok.io:26565 SSH for device f8dc7ab64415
+ra_2ntG8TJC8yV6sD6Lv3rjslnEvyL 5.tcp.ngrok.io:22267 SSH for device f8dc7abac9c1
+ra_2ntG8sxXqJvsCnmA3vDGdvoB8Xr 5.tcp.ngrok.io:25014 SSH for device f8dc7abac9b9
+ra_2ntdyLJzBVS7u30jxRC1pXWAoB2 5.tcp.ngrok.io:24474 SSH for device f8dc7abac90d
+ra_2ntD8EUyFxFotYtHL54DuqiMIYH 3.tcp.ngrok.io:29127 SSH for device f8dc7abac905
+ra_2ntCztRcS7vVJW6WcGLLbX14cAH 3.tcp.ngrok.io:28770 SSH for device f8dc7abac8c9
+ra_2ntclw4f3exNcbG7DiBg8QlziRT 5.tcp.ngrok.io:26499 SSH for device f8dc7abac95d
+ra_2ntbLYACzsi5yaqOuhTtkcWGSC6 5.tcp.ngrok.io:22098 SSH for device f8dc7abac959
+ra_2nt9oZbj9ILGaR6JBPwpBKu3Bg6 1.tcp.ngrok.io:25220 SSH for device f8dc7ab643f5
+ra_2nt9hzZiZUfudN8JEngVPJbMNAi 5.tcp.ngrok.io:21364 SSH for device f8dc7abac995
+ra_2nt5TJDMcXkcNfKM2z97ZhOLcYx 5.tcp.ngrok.io:21356 SSH for device f8dc7ab64371
+ra_2nt5tJBw6N6VWr3yMyFmedHR7qu 1.tcp.ngrok.io:25203 SSH for device f8dc7ab643d5
+ra_2nqZvn7PlfYID3JlCMrapsWD8BU 5.tcp.ngrok.io:25554 SSH for device f8dc7ab643c1
+ra_2nqz2NCy5hDQR3bMZfNECn9BtvV 3.tcp.ngrok.io:28512 SSH for device f8dc7abac8d5
+ra_2nqXOjNtHSoeUCi1AoazXX7Bi85 3.tcp.ngrok.io:24189 SSH for device f8dc7abac8f9
+ra_2nqVdvoZgwg9SeCaxlnqverFDH4 1.tcp.ngrok.io:25104 SSH for device f8dc7abac9bd
+ra_2nqvaWI8694sORZpCrX21CRUH75 3.tcp.ngrok.io:25955 SSH for device f8dc7abaca11
+ra_2nqSkj4SDYnfZ9vxafLewpx0QMR 3.tcp.ngrok.io:24952 SSH for device f8dc7ab6444d
+ra_2nqsJyj8uik6bl3uBGcxaaP6Dzb 3.tcp.ngrok.io:28074 SSH for device f8dc7ab64361
+ra_2nqdNj65scSbbxs4MMCmQrcmDQt 3.tcp.ngrok.io:23857 SSH for device f8dc7ab6443d
+ra_2nqaf8DagnFP5uFgeoauZS3O7Lv 5.tcp.ngrok.io:20251 SSH for device f8dc7ab64359
+ra_2nnyedNCmUyzapt2DJpkRLX6gin 5.tcp.ngrok.io:25691 SSH for device f8dc7abac949
+ra_2nlMeyakWkXDGl5BWqb2Skffxe2 3.tcp.ngrok.io:29106 SSH for device f8dc7ab64445
+ra_2nlDa04sH6bgpuniPjBQuLNIE26 1.tcp.ngrok.io:25054 SSH for device f8dc7abaca31
+ra_2mWNAFLX4AyRxNgWBBCMHAu4REn 3.tcp.ngrok.io:29093 SSH for device f8dc7a50cfcf
+ra_2mL4pjwuGIPqbufvZIxvnMxLYjH 5.tcp.ngrok.io:20085 SSH for device f8dc7a50d29f
+ra_2mDAt5gdXHW1s1SRMKqdjibyEL1 5.tcp.ngrok.io:20944 SSH for device f8dc7a50d653
+ra_2mCaXt1wkCz3pZrYmGqyEyDy0C0 5.tcp.ngrok.io:23065 SSH for device f8dc7a50d64b
+ra_2mAWHQCJaYcFooDHmRutQqbP2sq 5.tcp.ngrok.io:23063 SSH for device f8dc7a50d3df
+ra_2mAOjfLVN3Akh15DSUHivHp4QTN 5.tcp.ngrok.io:22237 SSH for device f8dc7a50d3f7
+ra_2mACGyT58hYaA3Qzh2wxC984rCJ 5.tcp.ngrok.io:23074 SSH for device f8dc7a50d30f
+ra_2m9Tie4xcHvOQGSrULAair0nnzl 5.tcp.ngrok.io:21296 SSH for device f8dc7a50d317
+ra_2m8PXyIGF8s099i3slnTT2S9KtS 5.tcp.ngrok.io:21304 SSH for device f8dc7ab643f9
+ra_2m14tE1AO579dje7PnaCqO8oSJx 5.tcp.ngrok.io:20107 SSH for device f8dc7ab64411
+ra_2lznqLQvfRwLzx2j0NlPYiCobtM 5.tcp.ngrok.io:20981 SSH for device f8dc7ab643b1
+ra_2ltU1pZuUF3L1i4n08MKmeECBrL 5.tcp.ngrok.io:22251 SSH for device f8dc7a50d3d7
+ra_2ltrbE3yHgYcWbFxSgTVTOsrEiH 5.tcp.ngrok.io:23048 SSH for device f8dc7a50d6b7
+
+
+88a29ecefd5e
