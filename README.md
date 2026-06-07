@@ -246,6 +246,3 @@ even an older `CARE001` tarball with the wrong defaults works correctly.
 - `~/gw2k-programmer-logs/password_transcript.log` — Passwords-tab log
   (Generate / Test / Write actions and their outcomes).
 
-## License
-
-(Add your license here.)
