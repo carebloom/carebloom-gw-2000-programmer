@@ -767,14 +767,20 @@ class App(tk.Tk):
 
         f2 = ttk.LabelFrame(wrap, text="First-boot configuration")
         f2.pack(fill="x", pady=(0, 8))
-        self._row(f2, 0, "Username:", self.username)
-        self._row(f2, 1, "Password:", self.password, show="•")
-        self._row(f2, 2, "Hostname:", self.hostname,
+        # First-boot user/password are intentionally fixed at 'pi' /
+        # 'raspberry' and not exposed in the UI. They're the credentials
+        # the flasher uses to SSH into the board between first boot and
+        # App Installation; the App Installation step then sets root +
+        # WCP to 'carebloom-eng', and the Passwords tab rotates those.
+        ttk.Label(f2, text="First-boot login: pi / raspberry (fixed)",
+                  foreground="#888").grid(row=0, column=0, columnspan=3,
+                                           sticky="w", padx=8, pady=(4, 2))
+        self._row(f2, 1, "Hostname:", self.hostname,
                   hint="  ({MAC} = full MAC, {MAC6} = last 6, {MACUPPER} = uppercase)")
-        self._row(f2, 3, "AP SSID:", self.wifi_ssid,
+        self._row(f2, 2, "AP SSID:", self.wifi_ssid,
                   hint="  (Wi-Fi AP for room anchors; {MAC} = eth0 MAC)")
-        self._row(f2, 4, "AP password:", self.wifi_psk, show="•")
-        self._row(f2, 5, "Wi-Fi country:", self.wifi_country)
+        self._row(f2, 3, "AP password:", self.wifi_psk)
+        self._row(f2, 4, "Wi-Fi country:", self.wifi_country)
 
         f4 = ttk.LabelFrame(wrap, text="Carebloom application")
         f4.pack(fill="x", pady=(0, 8))
@@ -1990,13 +1996,14 @@ class App(tk.Tk):
             "rpiboot_path": self.rpiboot_path.get(),
             "bootfiles_dir": self.bootfiles_dir.get(),
             "image_path": self.image_path.get(),
-            "username": self.username.get(),
             "hostname": self.hostname.get(),
             "wifi_ssid": self.wifi_ssid.get(),
             "wifi_country": self.wifi_country.get(),
             "app_zip_path": self.app_zip_path.get(),
             "app_name": self.app_name.get(),
-            # passwords intentionally NOT saved
+            # username/password intentionally NOT saved - first-boot login
+            # is fixed at pi/raspberry; rotation happens via the Passwords
+            # tab after App Installation.
         }
         try:
             with open(CONFIG_FILE, "w") as f:
@@ -2016,6 +2023,11 @@ class App(tk.Tk):
                 messagebox.showerror("Load failed", str(e))
             return
         for k, v in d.items():
+            # 'username' was previously persisted; the first-boot login is
+            # now fixed at pi/raspberry, so an old config file's value is
+            # ignored. ('password' was never persisted.)
+            if k in ("username", "password"):
+                continue
             if hasattr(self, k) and isinstance(getattr(self, k), tk.StringVar):
                 getattr(self, k).set(v)
         if not silent:
@@ -4472,4 +4484,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
